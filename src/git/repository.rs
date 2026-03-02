@@ -1159,13 +1159,9 @@ fn parse_git_var_identity(output: &str) -> GitAuthorIdentity {
             }
         }
         _ => {
-            // No angle brackets - just treat as name
+            // No angle brackets - just treat the whole string as a name
             GitAuthorIdentity {
-                name: if trimmed.is_empty() {
-                    None
-                } else {
-                    Some(trimmed.to_string())
-                },
+                name: Some(trimmed.to_string()),
                 email: None,
             }
         }
@@ -1461,8 +1457,8 @@ impl Repository {
     /// Get the effective git author identity for this repository.
     ///
     /// Uses `git var GIT_COMMITTER_IDENT` which respects the full git identity precedence:
-    /// `GIT_COMMITTER_NAME`/`GIT_COMMITTER_EMAIL` env vars > `GIT_AUTHOR_NAME`/`GIT_AUTHOR_EMAIL`
-    /// env vars > `user.name`/`user.email` config > system defaults.
+    /// `GIT_COMMITTER_NAME`/`GIT_COMMITTER_EMAIL` env vars > `user.name`/`user.email` config >
+    /// system defaults.
     ///
     /// Falls back to `git config user.name` / `user.email` if `git var` fails.
     /// The result is cached per Repository instance for performance.
