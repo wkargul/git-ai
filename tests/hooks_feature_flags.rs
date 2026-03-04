@@ -271,9 +271,13 @@ fn externally_managed_preserves_original_hooks_path_for_remove() {
     let hooks_path_after_first_ensure = repo
         .git(&["config", "--local", "--get", "core.hooksPath"])
         .expect("hooksPath should exist after ensure");
+    // Canonicalize to handle macOS /var -> /private/var symlink.
+    let canon_actual = fs::canonicalize(hooks_path_after_first_ensure.trim())
+        .expect("canonicalize actual hooks path");
+    let canon_expected =
+        fs::canonicalize(&managed_hooks_dir).expect("canonicalize managed hooks dir");
     assert_eq!(
-        hooks_path_after_first_ensure.trim(),
-        managed_hooks_dir.to_string_lossy().as_ref(),
+        canon_actual, canon_expected,
         "first ensure should set core.hooksPath to managed hooks dir"
     );
 
@@ -294,9 +298,12 @@ fn externally_managed_preserves_original_hooks_path_for_remove() {
     let hooks_path_after_remove = repo
         .git(&["config", "--local", "--get", "core.hooksPath"])
         .expect("hooksPath should be restored after remove");
+    // Canonicalize to handle macOS /var -> /private/var symlink.
+    let canon_after_remove =
+        fs::canonicalize(hooks_path_after_remove.trim()).expect("canonicalize restored hooks path");
+    let canon_user_hooks = fs::canonicalize(&user_hooks_dir).expect("canonicalize user hooks dir");
     assert_eq!(
-        hooks_path_after_remove.trim(),
-        user_hooks_dir.to_string_lossy().as_ref(),
+        canon_after_remove, canon_user_hooks,
         "remove should restore the user's original core.hooksPath"
     );
 }
