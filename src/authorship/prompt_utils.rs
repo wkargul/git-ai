@@ -3,7 +3,7 @@ use crate::authorship::internal_db::InternalDatabase;
 use crate::authorship::transcript::AiTranscript;
 use crate::commands::checkpoint_agent::agent_presets::{
     ClaudePreset, CodexPreset, ContinueCliPreset, CursorPreset, DroidPreset, GeminiPreset,
-    GithubCopilotPreset,
+    GithubCopilotPreset, WindsurfPreset,
 };
 use crate::commands::checkpoint_agent::amp_preset::AmpPreset;
 use crate::commands::checkpoint_agent::opencode_preset::OpenCodePreset;
@@ -178,6 +178,7 @@ pub fn update_prompt_from_tool(
         "droid" => update_droid_prompt(agent_metadata, current_model),
         "amp" => update_amp_prompt(external_thread_id, agent_metadata, current_model),
         "opencode" => update_opencode_prompt(external_thread_id, agent_metadata, current_model),
+        "windsurf" => update_windsurf_prompt(agent_metadata, current_model),
         _ => {
             debug_log(&format!("Unknown tool: {}", tool));
             PromptUpdateResult::Unchanged
@@ -576,6 +577,41 @@ fn update_opencode_prompt(
             );
             PromptUpdateResult::Failed(e)
         }
+    }
+}
+
+/// Update Windsurf prompt from transcript JSONL file
+fn update_windsurf_prompt(
+    metadata: Option<&HashMap<String, String>>,
+    current_model: &str,
+) -> PromptUpdateResult {
+    if let Some(metadata) = metadata {
+        if let Some(transcript_path) = metadata.get("transcript_path") {
+            match WindsurfPreset::transcript_and_model_from_windsurf_jsonl(transcript_path) {
+                Ok((transcript, model)) => PromptUpdateResult::Updated(
+                    transcript,
+                    model.unwrap_or_else(|| current_model.to_string()),
+                ),
+                Err(e) => {
+                    debug_log(&format!(
+                        "Failed to parse Windsurf JSONL transcript from {}: {}",
+                        transcript_path, e
+                    ));
+                    log_error(
+                        &e,
+                        Some(serde_json::json!({
+                            "agent_tool": "windsurf",
+                            "operation": "transcript_and_model_from_windsurf_jsonl"
+                        })),
+                    );
+                    PromptUpdateResult::Failed(e)
+                }
+            }
+        } else {
+            PromptUpdateResult::Unchanged
+        }
+    } else {
+        PromptUpdateResult::Unchanged
     }
 }
 
@@ -1197,6 +1233,10 @@ mod tests {
             | PromptUpdateResult::Failed(_)
             | PromptUpdateResult::Updated(_, _) => {}
         }
+
+        // Test dispatch to windsurf
+        let result = update_prompt_from_tool("windsurf", "trajectory-123", None, "model");
+        assert!(matches!(result, PromptUpdateResult::Unchanged));
     }
 
     #[test]
@@ -1318,6 +1358,31 @@ mod tests {
         );
 
         let result = update_droid_prompt(Some(&metadata), "gpt-4");
+        assert!(matches!(result, PromptUpdateResult::Failed(_)));
+    }
+
+    #[test]
+    fn test_update_windsurf_prompt_no_metadata() {
+        let result = update_windsurf_prompt(None, "unknown");
+        assert!(matches!(result, PromptUpdateResult::Unchanged));
+    }
+
+    #[test]
+    fn test_update_windsurf_prompt_no_transcript_path() {
+        let metadata = HashMap::new();
+        let result = update_windsurf_prompt(Some(&metadata), "unknown");
+        assert!(matches!(result, PromptUpdateResult::Unchanged));
+    }
+
+    #[test]
+    fn test_update_windsurf_prompt_invalid_path() {
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            "transcript_path".to_string(),
+            "/nonexistent/path.jsonl".to_string(),
+        );
+
+        let result = update_windsurf_prompt(Some(&metadata), "unknown");
         assert!(matches!(result, PromptUpdateResult::Failed(_)));
     }
 
