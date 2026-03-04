@@ -61,7 +61,7 @@ fn hooks_enabled_flag_causes_checkpoint_to_ensure_hooks() {
     let repo = TestRepo::new();
 
     let managed_hooks_dir = git_hooks_ai_dir(&repo).join("hooks");
-    let marker_path = git_hooks_ai_dir(&repo).join("git_hooks_enabled");
+    let marker_path = git_hooks_ai_dir(&repo).join("git_hooks_enabled"); // enablement marker file name
 
     // Verify hooks are NOT set up initially (no explicit git-hooks ensure was run
     // beyond what TestRepo::new does for wrapper mode, but wrapper mode doesn't
@@ -86,7 +86,7 @@ fn hooks_enabled_flag_causes_checkpoint_to_ensure_hooks() {
     // Run checkpoint with hooks_enabled feature flag set via environment variable
     repo.git_ai_with_env(
         &["checkpoint", "mock_ai", "flag-test.txt"],
-        &[("GIT_AI_HOOKS_ENABLED", "true")],
+        &[("GIT_AI_GIT_HOOKS_ENABLED", "true")],
     )
     .expect("checkpoint with hooks_enabled should succeed");
 
@@ -124,7 +124,7 @@ fn hooks_disabled_flag_does_not_ensure_hooks_on_clean_repo() {
 
     repo.git_ai_with_env(
         &["checkpoint", "mock_ai", "no-flag-test.txt"],
-        &[("GIT_AI_HOOKS_ENABLED", "false")],
+        &[("GIT_AI_GIT_HOOKS_ENABLED", "false")],
     )
     .expect("checkpoint without hooks_enabled should succeed");
 
@@ -161,8 +161,8 @@ fn externally_managed_hooks_skips_git_config_change() {
     repo.git_ai_with_env(
         &["git-hooks", "ensure"],
         &[
-            ("GIT_AI_HOOKS_ENABLED", "true"),
-            ("GIT_AI_HOOKS_EXTERNALLY_MANAGED", "true"),
+            ("GIT_AI_GIT_HOOKS_ENABLED", "true"),
+            ("GIT_AI_GIT_HOOKS_EXTERNALLY_MANAGED", "true"),
         ],
     )
     .expect("git-hooks ensure with externally_managed should succeed");
@@ -204,8 +204,8 @@ fn externally_managed_hooks_disables_forwarding() {
     repo.git_ai_with_env(
         &["git-hooks", "ensure"],
         &[
-            ("GIT_AI_HOOKS_ENABLED", "true"),
-            ("GIT_AI_HOOKS_EXTERNALLY_MANAGED", "true"),
+            ("GIT_AI_GIT_HOOKS_ENABLED", "true"),
+            ("GIT_AI_GIT_HOOKS_EXTERNALLY_MANAGED", "true"),
         ],
     )
     .expect("git-hooks ensure with externally_managed should succeed");
@@ -265,8 +265,8 @@ fn externally_managed_without_hooks_enabled_has_no_effect() {
     repo.git_ai_with_env(
         &["checkpoint", "mock_ai", "no-effect-test.txt"],
         &[
-            ("GIT_AI_HOOKS_ENABLED", "false"),
-            ("GIT_AI_HOOKS_EXTERNALLY_MANAGED", "true"),
+            ("GIT_AI_GIT_HOOKS_ENABLED", "false"),
+            ("GIT_AI_GIT_HOOKS_EXTERNALLY_MANAGED", "true"),
         ],
     )
     .expect("checkpoint should succeed");
@@ -289,12 +289,12 @@ fn cli_config_set_and_get_hooks_enabled() {
     let repo = TestRepo::new();
 
     // Set hooks_enabled via CLI config
-    repo.git_ai(&["config", "set", "feature_flags.hooks_enabled", "true"])
+    repo.git_ai(&["config", "set", "feature_flags.git_hooks_enabled", "true"])
         .expect("config set hooks_enabled should succeed");
 
     // Get the value back (config get syntax is: git-ai config <key>)
     let result = repo
-        .git_ai(&["config", "feature_flags.hooks_enabled"])
+        .git_ai(&["config", "feature_flags.git_hooks_enabled"])
         .expect("config get hooks_enabled should succeed");
     assert!(
         result.contains("true"),
@@ -303,11 +303,11 @@ fn cli_config_set_and_get_hooks_enabled() {
     );
 
     // Set to false
-    repo.git_ai(&["config", "set", "feature_flags.hooks_enabled", "false"])
+    repo.git_ai(&["config", "set", "feature_flags.git_hooks_enabled", "false"])
         .expect("config set hooks_enabled to false should succeed");
 
     let result = repo
-        .git_ai(&["config", "feature_flags.hooks_enabled"])
+        .git_ai(&["config", "feature_flags.git_hooks_enabled"])
         .expect("config get hooks_enabled should succeed");
     assert!(
         result.contains("false"),
@@ -326,14 +326,14 @@ fn cli_config_set_and_get_hooks_externally_managed() {
     repo.git_ai(&[
         "config",
         "set",
-        "feature_flags.hooks_externally_managed",
+        "feature_flags.git_hooks_externally_managed",
         "true",
     ])
     .expect("config set hooks_externally_managed should succeed");
 
     // Get the value back (config get syntax is: git-ai config <key>)
     let result = repo
-        .git_ai(&["config", "feature_flags.hooks_externally_managed"])
+        .git_ai(&["config", "feature_flags.git_hooks_externally_managed"])
         .expect("config get hooks_externally_managed should succeed");
     assert!(
         result.contains("true"),
@@ -349,13 +349,13 @@ fn cli_config_unset_hooks_enabled() {
     let repo = TestRepo::new();
 
     // Set then unset
-    repo.git_ai(&["config", "set", "feature_flags.hooks_enabled", "true"])
+    repo.git_ai(&["config", "set", "feature_flags.git_hooks_enabled", "true"])
         .expect("config set should succeed");
-    repo.git_ai(&["config", "unset", "feature_flags.hooks_enabled"])
+    repo.git_ai(&["config", "unset", "feature_flags.git_hooks_enabled"])
         .expect("config unset hooks_enabled should succeed");
 
     // After unset, getting the key should either error or show the default (false)
-    let result = repo.git_ai(&["config", "feature_flags.hooks_enabled"]);
+    let result = repo.git_ai(&["config", "feature_flags.git_hooks_enabled"]);
     // It's acceptable for this to either return the default or to report the key isn't set
     match result {
         Ok(output) => {
@@ -382,14 +382,18 @@ fn cli_config_unset_hooks_externally_managed() {
     repo.git_ai(&[
         "config",
         "set",
-        "feature_flags.hooks_externally_managed",
+        "feature_flags.git_hooks_externally_managed",
         "true",
     ])
     .expect("config set should succeed");
-    repo.git_ai(&["config", "unset", "feature_flags.hooks_externally_managed"])
-        .expect("config unset hooks_externally_managed should succeed");
+    repo.git_ai(&[
+        "config",
+        "unset",
+        "feature_flags.git_hooks_externally_managed",
+    ])
+    .expect("config unset hooks_externally_managed should succeed");
 
-    let result = repo.git_ai(&["config", "feature_flags.hooks_externally_managed"]);
+    let result = repo.git_ai(&["config", "feature_flags.git_hooks_externally_managed"]);
     match result {
         Ok(output) => {
             assert!(

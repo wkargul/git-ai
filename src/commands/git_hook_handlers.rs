@@ -781,7 +781,7 @@ fn select_forward_target_for_repo(
 ) -> (ForwardMode, Option<String>, Option<String>) {
     // When hooks are externally managed, disable all forwarding
     let feature_flags = config::Config::get().get_feature_flags().clone();
-    if feature_flags.hooks_enabled && feature_flags.hooks_externally_managed {
+    if feature_flags.git_hooks_enabled && feature_flags.git_hooks_externally_managed {
         return (ForwardMode::None, None, None);
     }
 
@@ -896,7 +896,8 @@ pub fn ensure_repo_hooks_installed(
 
     // Skip changing git config when hooks are externally managed
     let feature_flags = config::Config::get().get_feature_flags().clone();
-    let externally_managed = feature_flags.hooks_enabled && feature_flags.hooks_externally_managed;
+    let externally_managed =
+        feature_flags.git_hooks_enabled && feature_flags.git_hooks_externally_managed;
     if !externally_managed {
         changed |= set_hooks_path_in_config(
             &local_config_path,
@@ -2630,12 +2631,12 @@ pub fn handle_git_hook_invocation(hook_name: &str, hook_args: &[String]) -> i32 
 
 pub fn ensure_repo_level_hooks_for_checkpoint(repo: &Repository) {
     let feature_flags = config::Config::get().get_feature_flags().clone();
-    if feature_flags.hooks_enabled {
-        // When the hooks_enabled feature flag is on, always ensure hooks are installed
+    if feature_flags.git_hooks_enabled {
+        // When the git_hooks_enabled feature flag is on, always ensure hooks are installed
         // regardless of whether they were previously set up.
         if let Err(err) = ensure_repo_hooks_installed(repo, false) {
             debug_log(&format!(
-                "ensure_repo_level_hooks_for_checkpoint (hooks_enabled): {}",
+                "ensure_repo_level_hooks_for_checkpoint (git_hooks_enabled): {}",
                 err
             ));
         }
