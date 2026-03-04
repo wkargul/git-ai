@@ -27,6 +27,15 @@ pub fn spawn_background_metrics_db_flush() {}
 
 /// Handle the flush-metrics-db command
 pub fn handle_flush_metrics_db(_args: &[String]) {
+    let is_background_worker = std::env::var(ENV_FLUSH_METRICS_DB_WORKER).as_deref() == Ok("1");
+    macro_rules! user_log {
+        ($($arg:tt)*) => {
+            if !is_background_worker {
+                eprintln!($($arg)*);
+            }
+        };
+    }
+
     // Check conditions: (!using_default_api) || is_logged_in()
     let context = ApiContext::new(None);
     let api_base_url = context.base_url.clone();
@@ -34,7 +43,7 @@ pub fn handle_flush_metrics_db(_args: &[String]) {
 
     let using_default_api = api_base_url == crate::config::DEFAULT_API_BASE_URL;
     if using_default_api && !client.is_logged_in() {
-        eprintln!("flush-metrics-db: skipping (not logged in and using default API)");
+        user_log!("flush-metrics-db: skipping (not logged in and using default API)");
         return;
     }
 
@@ -42,7 +51,7 @@ pub fn handle_flush_metrics_db(_args: &[String]) {
     let db = match MetricsDatabase::global() {
         Ok(db) => db,
         Err(e) => {
-            eprintln!("flush-metrics-db: failed to open metrics database: {}", e);
+            user_log!("flush-metrics-db: failed to open metrics database: {}", e);
             return;
         }
     };
@@ -57,14 +66,14 @@ pub fn handle_flush_metrics_db(_args: &[String]) {
             let db_lock = match db.lock() {
                 Ok(lock) => lock,
                 Err(e) => {
-                    eprintln!("flush-metrics-db: failed to acquire db lock: {}", e);
+                    user_log!("flush-metrics-db: failed to acquire db lock: {}", e);
                     break;
                 }
             };
             match db_lock.get_batch(MAX_BATCH_SIZE) {
                 Ok(batch) => batch,
                 Err(e) => {
-                    eprintln!("flush-metrics-db: failed to read batch: {}", e);
+                    user_log!("flush-metrics-db: failed to read batch: {}", e);
                     break;
                 }
             }
@@ -104,9 +113,10 @@ pub fn handle_flush_metrics_db(_args: &[String]) {
             Ok(()) => {
                 total_uploaded += event_count;
                 total_batches += 1;
-                eprintln!(
+                user_log!(
                     "  ✓ batch {} - uploaded {} events",
-                    total_batches, event_count
+                    total_batches,
+                    event_count
                 );
                 // Success - delete ALL records from this batch
                 // Validation errors are logged to Sentry and won't succeed on retry
@@ -116,9 +126,10 @@ pub fn handle_flush_metrics_db(_args: &[String]) {
             }
             Err(e) => {
                 // All retries failed - keep records in DB for next time
-                eprintln!(
+                user_log!(
                     "  ✗ batch upload failed ({} events kept for retry): {}",
-                    event_count, e
+                    event_count,
+                    e
                 );
                 break;
             }
@@ -126,14 +137,15 @@ pub fn handle_flush_metrics_db(_args: &[String]) {
     }
 
     if total_invalid > 0 {
-        eprintln!(
+        user_log!(
             "flush-metrics-db: discarded {} invalid record(s)",
             total_invalid
         );
     }
 
-    eprintln!(
+    user_log!(
         "flush-metrics-db: uploaded {} events in {} batch(es)",
-        total_uploaded, total_batches
+        total_uploaded,
+        total_batches
     );
 }

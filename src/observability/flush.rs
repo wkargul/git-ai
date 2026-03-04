@@ -13,6 +13,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Handle the flush-logs command
 pub fn handle_flush_logs(args: &[String]) {
+    let is_background_worker = std::env::var(super::ENV_FLUSH_LOGS_WORKER).as_deref() == Ok("1");
+
     // Acquire exclusive lock — if another flush-logs is already running, exit immediately
     let _lock = {
         let lock_path =
@@ -25,7 +27,9 @@ pub fn handle_flush_logs(args: &[String]) {
         match lock_path.and_then(|p| crate::utils::LockFile::try_acquire(&p)) {
             Some(lock) => lock,
             None => {
-                eprintln!("Another flush-logs process is already running. Skipping.");
+                if !is_background_worker {
+                    eprintln!("Another flush-logs process is already running. Skipping.");
+                }
                 std::process::exit(0);
             }
         }
@@ -63,7 +67,9 @@ pub fn handle_flush_logs(args: &[String]) {
 
     // Get the global logs directory
     let Some(logs_dir) = get_logs_directory() else {
-        eprintln!("No logs directory found (~/.git-ai/internal/logs). Nothing to flush.");
+        if !is_background_worker {
+            eprintln!("No logs directory found (~/.git-ai/internal/logs). Nothing to flush.");
+        }
         std::process::exit(0);
     };
 
@@ -103,7 +109,9 @@ pub fn handle_flush_logs(args: &[String]) {
         .collect();
 
     if log_files.is_empty() {
-        eprintln!("No log files to flush.");
+        if !is_background_worker {
+            eprintln!("No log files to flush.");
+        }
         std::process::exit(0);
     }
 
