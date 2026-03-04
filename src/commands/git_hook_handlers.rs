@@ -2502,12 +2502,14 @@ fn hook_requires_managed_repo_lookup(
                 })
                 .unwrap_or(false);
 
-            let has_stash_update = parse_whitespace_fields(stdin_data, 3)
-                .iter()
-                .any(|fields| fields.len() >= 3 && fields[2] == "refs/stash");
-
-            if has_stash_update && config::Config::get().feature_flags().rewrite_stash {
-                return matches!(phase, "prepared" | "committed" | "aborted");
+            let rewrite_stash_enabled = config::Config::get().feature_flags().rewrite_stash;
+            if rewrite_stash_enabled {
+                let has_stash_update = parse_whitespace_fields(stdin_data, 3)
+                    .iter()
+                    .any(|fields| fields.len() >= 3 && fields[2] == "refs/stash");
+                if has_stash_update {
+                    return matches!(phase, "prepared" | "committed" | "aborted");
+                }
             }
 
             if phase != "committed" {
