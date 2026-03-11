@@ -3380,7 +3380,10 @@ mod tests {
                 accepted_lines: 5,
                 overriden_lines: 0,
                 messages_url: None,
-                custom_attributes: None,
+                custom_attributes: Some(HashMap::from([
+                    ("employee_id".to_string(), "E100".to_string()),
+                    ("team".to_string(), "test".to_string()),
+                ])),
             },
         );
 
@@ -3569,7 +3572,10 @@ mod tests {
                 accepted_lines: 13,
                 overriden_lines: 0,
                 messages_url: None,
-                custom_attributes: None,
+                custom_attributes: Some(HashMap::from([
+                    ("employee_id".to_string(), "E200".to_string()),
+                    ("team".to_string(), "platform".to_string()),
+                ])),
             },
         );
         prompts.insert(
@@ -3587,7 +3593,10 @@ mod tests {
                 accepted_lines: 6,
                 overriden_lines: 0,
                 messages_url: None,
-                custom_attributes: None,
+                custom_attributes: Some(HashMap::from([
+                    ("employee_id".to_string(), "E200".to_string()),
+                    ("team".to_string(), "platform".to_string()),
+                ])),
             },
         );
 
@@ -3694,7 +3703,10 @@ mod tests {
                 accepted_lines: 3,
                 overriden_lines: 0,
                 messages_url: None,
-                custom_attributes: None,
+                custom_attributes: Some(HashMap::from([
+                    ("employee_id".to_string(), "E300".to_string()),
+                    ("team".to_string(), "infra".to_string()),
+                ])),
             },
         );
 
@@ -3834,7 +3846,10 @@ mod tests {
                 accepted_lines: 4,
                 overriden_lines: 0,
                 messages_url: None,
-                custom_attributes: None,
+                custom_attributes: Some(HashMap::from([
+                    ("employee_id".to_string(), "E400".to_string()),
+                    ("team".to_string(), "backend".to_string()),
+                ])),
             },
         );
         let old_wl = repo
@@ -3957,7 +3972,10 @@ mod tests {
                 accepted_lines: 8,
                 overriden_lines: 0,
                 messages_url: None,
-                custom_attributes: None,
+                custom_attributes: Some(HashMap::from([
+                    ("employee_id".to_string(), "E400".to_string()),
+                    ("team".to_string(), "backend".to_string()),
+                ])),
             },
         );
         let v1_wl = repo
@@ -4125,7 +4143,10 @@ mod tests {
                 accepted_lines: 13,
                 overriden_lines: 0,
                 messages_url: None,
-                custom_attributes: None,
+                custom_attributes: Some(HashMap::from([
+                    ("employee_id".to_string(), "E500".to_string()),
+                    ("team".to_string(), "security".to_string()),
+                ])),
             },
         );
         prompts.insert(
@@ -4143,7 +4164,10 @@ mod tests {
                 accepted_lines: 16,
                 overriden_lines: 0,
                 messages_url: None,
-                custom_attributes: None,
+                custom_attributes: Some(HashMap::from([
+                    ("employee_id".to_string(), "E500".to_string()),
+                    ("team".to_string(), "security".to_string()),
+                ])),
             },
         );
 

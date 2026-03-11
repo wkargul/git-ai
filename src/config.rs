@@ -173,6 +173,8 @@ pub struct ConfigPatch {
     pub disable_auto_updates: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_storage: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom_attributes: Option<HashMap<String, String>>,
 }
 
 impl Config {
@@ -942,6 +944,9 @@ fn apply_test_config_patch(config: &mut Config) {
                     prompt_storage
                 );
             }
+        }
+        if let Some(custom_attributes) = patch.custom_attributes {
+            config.custom_attributes = custom_attributes;
         }
     }
 }
