@@ -27,25 +27,29 @@ pub fn handle_whoami(args: &[String]) {
     if let Some(api_key) = &api_ctx.api_key {
         let masked = mask_api_key(api_key);
         println!("API key: {}", masked);
-        println!("Auth state: api key");
-        return;
     }
 
     match &auth.state {
         AuthState::LoggedOut => {
             println!("Auth state: logged out");
-            std::process::exit(1);
+            if api_ctx.api_key.is_none() {
+                std::process::exit(1);
+            }
         }
         AuthState::LoggedIn => {
             println!("Auth state: logged in");
         }
         AuthState::RefreshExpired => {
             println!("Auth state: credentials expired (refresh token expired)");
-            std::process::exit(1);
+            if api_ctx.api_key.is_none() {
+                std::process::exit(1);
+            }
         }
         AuthState::Error(err) => {
             println!("Auth state: error ({})", err);
-            std::process::exit(1);
+            if api_ctx.api_key.is_none() {
+                std::process::exit(1);
+            }
         }
     }
 

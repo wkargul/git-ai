@@ -167,10 +167,10 @@ impl ApiContext {
             .with_header("Content-Type", "application/json")
             .with_body(body_json);
 
-        // API key takes precedence over OAuth token when both are present
         if let Some(api_key) = &self.api_key {
             request = request.with_header("X-API-Key", api_key);
-        } else if let Some(token) = &self.auth_token {
+        }
+        if let Some(token) = &self.auth_token {
             request = request.with_header("Authorization", format!("Bearer {}", token));
         }
 
@@ -192,10 +192,10 @@ impl ApiContext {
 
         let mut request = Self::http_get(&url);
 
-        // API key takes precedence over OAuth token when both are present
         if let Some(api_key) = &self.api_key {
             request = request.with_header("X-API-Key", api_key);
-        } else if let Some(token) = &self.auth_token {
+        }
+        if let Some(token) = &self.auth_token {
             request = request.with_header("Authorization", format!("Bearer {}", token));
         }
 
