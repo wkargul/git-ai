@@ -31,9 +31,6 @@ class DocumentChangeTrackerService : Disposable {
     // Shared tracking state — files recently touched by AI agents, keyed by absolute path
     private val agentTouchedFiles = ConcurrentHashMap<String, TrackedAgent>()
 
-    // Staleness threshold for tracked files (5 minutes)
-    private val staleThresholdMs = 300_000L
-
     init {
         thisLogger().warn("DocumentChangeTrackerService initializing...")
 
@@ -47,7 +44,7 @@ class DocumentChangeTrackerService : Disposable {
         // Periodic eviction of stale tracking entries
         scheduler.scheduleAtFixedRate(
             { evictStaleEntries() },
-            staleThresholdMs, staleThresholdMs, TimeUnit.MILLISECONDS
+            TrackedAgent.STALE_THRESHOLD_MS, TrackedAgent.STALE_THRESHOLD_MS, TimeUnit.MILLISECONDS
         )
 
         thisLogger().warn("DocumentChangeTrackerService initialized - tracking document changes and VFS refreshes")
@@ -56,7 +53,7 @@ class DocumentChangeTrackerService : Disposable {
     private fun evictStaleEntries() {
         val now = System.currentTimeMillis()
         agentTouchedFiles.entries.removeIf { entry ->
-            now - entry.value.trackedAt > staleThresholdMs
+            now - entry.value.trackedAt > TrackedAgent.STALE_THRESHOLD_MS
         }
     }
 

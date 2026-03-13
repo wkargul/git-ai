@@ -30,9 +30,6 @@ class VfsRefreshListener(
     // Sweep checkpoint debounce (5 seconds) - batches VFS refresh events
     private val sweepDebounceMs = 5000L
 
-    // Staleness threshold for tracked files (5 minutes)
-    private val staleThresholdMs = 300_000L
-
     // Pending sweep checkpoints per workspace root (debounced)
     private val pendingSweeps = ConcurrentHashMap<String, ScheduledFuture<*>>()
 
@@ -74,9 +71,10 @@ class VfsRefreshListener(
         val entriesByAgent = mutableMapOf<String, MutableList<SweepEntry>>()
 
         for ((absolutePath, tracked) in filesToSweep) {
-            agentTouchedFiles.remove(absolutePath)
-
-            if (now - tracked.trackedAt > staleThresholdMs) continue
+            if (now - tracked.trackedAt > TrackedAgent.STALE_THRESHOLD_MS) {
+                agentTouchedFiles.remove(absolutePath)
+                continue
+            }
 
             val relativePath = toRelativePath(absolutePath, workspaceRoot)
             val content = ApplicationManager.getApplication().runReadAction<String?> {
@@ -86,6 +84,7 @@ class VfsRefreshListener(
 
             if (content == tracked.lastCheckpointContent) continue
 
+            agentTouchedFiles.remove(absolutePath)
             entriesByAgent.getOrPut(tracked.agentName) { mutableListOf() }
                 .add(SweepEntry(relativePath, content))
         }

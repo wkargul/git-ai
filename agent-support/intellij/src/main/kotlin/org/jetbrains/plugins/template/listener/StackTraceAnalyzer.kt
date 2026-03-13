@@ -32,8 +32,11 @@ object StackTraceAnalyzer {
         ),
         AgentPattern(
             name = "junie",
-            packagePatterns = listOf("com.intellij.ml.llm.matterhorn.junie"),
-            classPatterns = listOf("junie")
+            packagePatterns = listOf(
+                "com.intellij.ml.llm.matterhorn.junie",
+                "com.intellij.ml.llm.matterhorn"
+            ),
+            classPatterns = listOf("junie", "matterhorn", "embark")
         )
     )
 
@@ -63,6 +66,9 @@ object StackTraceAnalyzer {
                         confidence = Confidence.HIGH
                         relevantFrames.add(frame)
                     } else if (detectedAgent == agent.name) {
+                        if (confidence == Confidence.MEDIUM) {
+                            confidence = Confidence.HIGH
+                        }
                         relevantFrames.add(frame)
                     }
                 } else if (matchesClass) {
