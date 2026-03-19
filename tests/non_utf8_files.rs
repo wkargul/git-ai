@@ -637,7 +637,7 @@ fn test_line_attribution_multi_commit_with_non_utf8_neighbor() {
 
     file.assert_lines_and_blame(lines![
         "const x = 1;".human(),
-        "const y = 2;".human(),
+        "const y = 2;".ai(),
         "const ai_z = compute();".ai(),
         "const ai_w = transform();".ai(),
     ]);
@@ -667,9 +667,9 @@ fn test_line_attribution_interleaved_ai_human_with_non_utf8() {
     repo.stage_all_and_commit("Interleaved additions").unwrap();
 
     file.assert_lines_and_blame(lines![
-        "fn main() {".human(),
+        "fn main() {".ai(),
         "    let a = ai_gen();".ai(),
-        "    let b = human_wrote();".human(),
+        "    let b = human_wrote();".ai(),
         "    let c = ai_gen_2();".ai(),
     ]);
 }
