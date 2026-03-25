@@ -208,10 +208,10 @@ pub fn detect_background_agent_tool() -> Option<String> {
     BACKGROUND_AGENT_TOOL
         .get_or_init(|| {
             // Explicit CLOUD_AGENT_TOOL env var takes highest priority
-            if let Ok(tool) = std::env::var("CLOUD_AGENT_TOOL") {
-                if !tool.is_empty() {
-                    return Some(tool);
-                }
+            if let Ok(tool) = std::env::var("CLOUD_AGENT_TOOL")
+                && !tool.is_empty()
+            {
+                return Some(tool);
             }
             // Cursor background agent
             if std::env::var("CURSOR_AGENT")
