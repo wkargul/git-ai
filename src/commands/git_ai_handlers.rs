@@ -1187,8 +1187,6 @@ fn run_checkpoint_via_daemon_or_local(
                             crate::utils::detect_background_agent_tool()
                                 .unwrap_or_else(|| "unknown".to_string()),
                         )
-                    } else if kind == CheckpointKind::Human {
-                        crate::utils::detect_background_agent_tool()
                     } else {
                         None
                     };

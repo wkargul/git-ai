@@ -980,8 +980,6 @@ pub fn prepare_captured_checkpoint(
                 crate::utils::detect_background_agent_tool()
                     .unwrap_or_else(|| "unknown".to_string()),
             )
-        } else if kind == CheckpointKind::Human {
-            crate::utils::detect_background_agent_tool()
         } else {
             None
         };
@@ -1800,8 +1798,8 @@ async fn get_checkpoint_entries(
     // When cloud_default_ai_attribution is enabled and this is a human checkpoint,
     // promote it to AiAgent so the working log and all downstream processing
     // treat it as an AI checkpoint attributed to the resolved cloud agent.
-    // Also treat a non-None pre_detected_cloud_env_tool as implying the flag,
-    // since the wrapper already decided cloud attribution applies.
+    // In the daemon path, the wrapper only sends pre_detected_cloud_env_tool when
+    // the flag was on in the wrapper's Config, so we also accept that as a signal.
     let cloud_attribution = if kind == CheckpointKind::Human
         && (Config::get()
             .get_feature_flags()
