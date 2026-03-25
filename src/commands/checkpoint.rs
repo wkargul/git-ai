@@ -576,9 +576,7 @@ fn resolve_live_checkpoint_execution(
         if has_no_ai_edits
             && !has_initial_attributions
             && !Config::get().get_feature_flags().inter_commit_move
-            && !Config::get()
-                .get_feature_flags()
-                .cloud_default_ai_attribution
+            && !Config::get().get_feature_flags().cloud_default_ai_attribution
         {
             debug_log("No AI edits in pre-commit checkpoint, skipping");
             return Ok(None);
@@ -743,19 +741,20 @@ fn execute_resolved_checkpoint(
     ));
 
     let entries_start = Instant::now();
-    let (entries, file_stats, cloud_agent_id) = smol::block_on(get_checkpoint_entries(
-        kind,
-        repo,
-        &working_log,
-        &resolved.files,
-        &file_content_hashes,
-        &checkpoints,
-        agent_run_result.as_ref(),
-        resolved.ts,
-        is_pre_commit,
-        Some(resolved.base_commit.as_str()),
-        captured_cloud_env_tool.as_deref(),
-    ))?;
+    let (entries, file_stats, effective_kind, cloud_agent_id) =
+        smol::block_on(get_checkpoint_entries(
+            kind,
+            repo,
+            &working_log,
+            &resolved.files,
+            &file_content_hashes,
+            &checkpoints,
+            agent_run_result.as_ref(),
+            resolved.ts,
+            is_pre_commit,
+            Some(resolved.base_commit.as_str()),
+            captured_cloud_env_tool.as_deref(),
+        ))?;
     debug_log(&format!(
         "[BENCHMARK] get_checkpoint_entries generated {} entries, took {:?}",
         entries.len(),
@@ -765,7 +764,7 @@ fn execute_resolved_checkpoint(
     if !entries.is_empty() {
         let checkpoint_create_start = Instant::now();
         let mut checkpoint = Checkpoint::new(
-            kind,
+            effective_kind,
             combined_hash.clone(),
             author.to_string(),
             entries.clone(),
@@ -773,25 +772,22 @@ fn execute_resolved_checkpoint(
         checkpoint.timestamp = (resolved.ts / 1000) as u64;
         checkpoint.line_stats = compute_line_stats(&file_stats)?;
 
-        if kind != CheckpointKind::Human
+        if let Some(cloud_aid) = &cloud_agent_id {
+            // Cloud-attributed checkpoint: set the resolved agent_id.
+            checkpoint.agent_id = Some(cloud_aid.clone());
+        } else if effective_kind != CheckpointKind::Human
             && let Some(agent_run) = &agent_run_result
         {
             checkpoint.transcript = Some(agent_run.transcript.clone().unwrap_or_default());
             checkpoint.agent_id = Some(agent_run.agent_id.clone());
             checkpoint.agent_metadata = agent_run.agent_metadata.clone();
         }
-
-        // When cloud_default_ai_attribution is enabled, set agent_id on human checkpoints
-        // so the working log records the attributed agent identity.
-        if let Some(cloud_aid) = &cloud_agent_id {
-            checkpoint.agent_id = Some(cloud_aid.clone());
-        }
         debug_log(&format!(
             "[BENCHMARK] Checkpoint creation took {:?}",
             checkpoint_create_start.elapsed()
         ));
 
-        if kind != CheckpointKind::Human
+        if effective_kind != CheckpointKind::Human
             && checkpoint.agent_id.is_some()
             && checkpoint.transcript.is_some()
             && let Err(e) = upsert_checkpoint_prompt_to_db(
@@ -824,7 +820,7 @@ fn execute_resolved_checkpoint(
         let attrs =
             build_checkpoint_attrs(repo, &resolved.base_commit, checkpoint.agent_id.as_ref());
 
-        if kind != CheckpointKind::Human
+        if effective_kind != CheckpointKind::Human
             && let Some(agent_id) = checkpoint.agent_id.as_ref()
             && should_emit_agent_usage(agent_id)
         {
@@ -846,7 +842,7 @@ fn execute_resolved_checkpoint(
         }
     }
 
-    let agent_tool = if kind != CheckpointKind::Human
+    let agent_tool = if effective_kind != CheckpointKind::Human
         && let Some(agent_run_result) = &agent_run_result
     {
         Some(agent_run_result.agent_id.tool.as_str())
@@ -872,7 +868,7 @@ fn execute_resolved_checkpoint(
         if files_with_entries == total_uncommitted_files {
             eprintln!(
                 "{} {} changed {} file(s) that have changed since the last {}",
-                kind.to_str(),
+                effective_kind.to_str(),
                 log_author,
                 files_with_entries,
                 label
@@ -880,7 +876,7 @@ fn execute_resolved_checkpoint(
         } else {
             eprintln!(
                 "{} {} changed {} of the {} file(s) that have changed since the last {} ({} already checkpointed)",
-                kind.to_str(),
+                effective_kind.to_str(),
                 log_author,
                 files_with_entries,
                 total_uncommitted_files,
@@ -1517,15 +1513,10 @@ fn get_checkpoint_entry_for_file(
     // Pre-commit fast path:
     // If this file has no prior AI attribution and no INITIAL attribution,
     // we can skip it entirely. Human-only files do not affect AI authorship.
-    // Exception: when cloud_default_ai_attribution is enabled, we need to
-    // process human files so they can be attributed to the most recent AI.
     if is_pre_commit
         && kind == CheckpointKind::Human
         && !has_prior_ai_edits
         && initial_attrs_for_file.is_empty()
-        && !Config::get()
-            .get_feature_flags()
-            .cloud_default_ai_attribution
     {
         return Ok(None);
     }
@@ -1537,14 +1528,9 @@ fn get_checkpoint_entry_for_file(
     // Non-pre-commit fast path:
     // Preserve existing `git-ai checkpoint` behavior for human-only files by writing an
     // attribution-empty entry while still capturing line stats.
-    // Exception: when cloud_default_ai_attribution is enabled, we need to run the full
-    // attribution pipeline so human edits are attributed to the most recent AI agent.
     if kind == CheckpointKind::Human
         && !has_prior_ai_edits
         && initial_attrs_for_file.is_empty()
-        && !Config::get()
-            .get_feature_flags()
-            .cloud_default_ai_attribution
     {
         let previous_content = if let Some(state) = previous_state.as_ref() {
             working_log
@@ -1801,7 +1787,8 @@ async fn get_checkpoint_entries(
     is_pre_commit: bool,
     head_commit_override: Option<&str>,
     pre_detected_cloud_env_tool: Option<&str>,
-) -> Result<(Vec<WorkingLogEntry>, Vec<FileLineStats>, Option<AgentId>), GitAiError> {
+) -> Result<(Vec<WorkingLogEntry>, Vec<FileLineStats>, CheckpointKind, Option<AgentId>), GitAiError>
+{
     let entries_fn_start = Instant::now();
 
     // Read INITIAL attributions from working log (empty if file doesn't exist)
@@ -1830,9 +1817,9 @@ async fn get_checkpoint_entries(
         precompute_start.elapsed()
     ));
 
-    // Determine author_id based on checkpoint kind and agent_id.
     // When cloud_default_ai_attribution is enabled and this is a human checkpoint,
-    // attribute changes to the most recent AI checkpoint's agent instead.
+    // promote it to AiAgent so the working log and all downstream processing
+    // treat it as an AI checkpoint attributed to the resolved cloud agent.
     let cloud_attribution = if kind == CheckpointKind::Human
         && Config::get()
             .get_feature_flags()
@@ -1844,6 +1831,11 @@ async fn get_checkpoint_entries(
         ))
     } else {
         None
+    };
+    let effective_kind = if cloud_attribution.is_some() {
+        CheckpointKind::AiAgent
+    } else {
+        kind
     };
 
     let author_id = if let Some((_, ref cloud_author_id)) = cloud_attribution {
@@ -1923,7 +1915,7 @@ async fn get_checkpoint_entries(
             smol::unblock(move || {
                 get_checkpoint_entry_for_file(
                     file_path,
-                    kind,
+                    effective_kind,
                     is_pre_commit,
                     repo,
                     working_log,
@@ -1984,7 +1976,7 @@ async fn get_checkpoint_entries(
     ));
 
     let resolved_agent_id = cloud_attribution.map(|(agent_id, _)| agent_id);
-    Ok((entries, file_stats, resolved_agent_id))
+    Ok((entries, file_stats, effective_kind, resolved_agent_id))
 }
 
 struct FileEntryInput<'a> {

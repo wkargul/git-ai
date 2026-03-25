@@ -36,18 +36,20 @@ fn test_cloud_attribution_human_uses_most_recent_ai_agent() {
     let working_log = repo.current_working_logs();
     let checkpoints = working_log.read_all_checkpoints().unwrap();
 
-    // Find the last human checkpoint
-    let human_cp = checkpoints
-        .iter()
-        .rev()
-        .find(|cp| cp.kind == git_ai::authorship::working_log::CheckpointKind::Human)
-        .expect("Should have a human checkpoint");
+    // With cloud_default_ai_attribution enabled, the human checkpoint is promoted
+    // to AiAgent kind and attributed to the most recent AI agent.
+    let cloud_cp = checkpoints
+        .last()
+        .expect("Should have checkpoints");
 
-    // With cloud_default_ai_attribution enabled, the human checkpoint should have
-    // an agent_id set (attributed to the most recent AI agent)
+    assert_eq!(
+        cloud_cp.kind,
+        git_ai::authorship::working_log::CheckpointKind::AiAgent,
+        "Cloud-attributed checkpoint should have AiAgent kind"
+    );
     assert!(
-        human_cp.agent_id.is_some(),
-        "Human checkpoint should have agent_id when cloud_default_ai_attribution is enabled"
+        cloud_cp.agent_id.is_some(),
+        "Cloud-attributed checkpoint should have agent_id"
     );
 }
 
@@ -111,18 +113,22 @@ fn test_cloud_attribution_no_ai_checkpoint_uses_fallback() {
     let working_log = repo.current_working_logs();
     let checkpoints = working_log.read_all_checkpoints().unwrap();
 
-    let human_cp = checkpoints
-        .iter()
-        .find(|cp| cp.kind == git_ai::authorship::working_log::CheckpointKind::Human)
-        .expect("Should have a human checkpoint");
+    let cloud_cp = checkpoints
+        .last()
+        .expect("Should have a checkpoint");
 
-    // With no previous AI checkpoint, should fall back to cloud env detection.
+    // With no previous AI checkpoint, should be promoted to AiAgent with fallback.
+    assert_eq!(
+        cloud_cp.kind,
+        git_ai::authorship::working_log::CheckpointKind::AiAgent,
+        "Cloud-attributed checkpoint should have AiAgent kind"
+    );
     assert!(
-        human_cp.agent_id.is_some(),
-        "Human checkpoint should have fallback agent_id when cloud_default_ai_attribution is enabled"
+        cloud_cp.agent_id.is_some(),
+        "Cloud-attributed checkpoint should have fallback agent_id"
     );
 
-    let agent_id = human_cp.agent_id.as_ref().unwrap();
+    let agent_id = cloud_cp.agent_id.as_ref().unwrap();
     assert_eq!(
         agent_id.id, "cloud-default",
         "Fallback agent_id should have id 'cloud-default'"
@@ -159,14 +165,14 @@ fn test_cloud_attribution_fallback_uses_cloud_agent_tool_env() {
     let working_log = repo.current_working_logs();
     let checkpoints = working_log.read_all_checkpoints().unwrap();
 
-    let human_cp = checkpoints
-        .iter()
-        .find(|cp| cp.kind == git_ai::authorship::working_log::CheckpointKind::Human)
-        .expect("Should have a human checkpoint");
+    let cloud_cp = checkpoints
+        .last()
+        .expect("Should have a checkpoint");
 
-    assert!(human_cp.agent_id.is_some());
+    assert_eq!(cloud_cp.kind, git_ai::authorship::working_log::CheckpointKind::AiAgent);
+    assert!(cloud_cp.agent_id.is_some());
 
-    let agent_id = human_cp.agent_id.as_ref().unwrap();
+    let agent_id = cloud_cp.agent_id.as_ref().unwrap();
     assert_eq!(
         agent_id.tool, "custom-cloud-tool",
         "Fallback should use CLOUD_AGENT_TOOL env var value"
@@ -196,14 +202,14 @@ fn test_cloud_attribution_fallback_detects_cursor_agent() {
     let working_log = repo.current_working_logs();
     let checkpoints = working_log.read_all_checkpoints().unwrap();
 
-    let human_cp = checkpoints
-        .iter()
-        .find(|cp| cp.kind == git_ai::authorship::working_log::CheckpointKind::Human)
-        .expect("Should have a human checkpoint");
+    let cloud_cp = checkpoints
+        .last()
+        .expect("Should have a checkpoint");
 
-    assert!(human_cp.agent_id.is_some());
+    assert_eq!(cloud_cp.kind, git_ai::authorship::working_log::CheckpointKind::AiAgent);
+    assert!(cloud_cp.agent_id.is_some());
 
-    let agent_id = human_cp.agent_id.as_ref().unwrap();
+    let agent_id = cloud_cp.agent_id.as_ref().unwrap();
     assert_eq!(
         agent_id.tool, "cursor-agent",
         "Fallback should detect cursor-agent from CURSOR_AGENT=1"
@@ -232,14 +238,14 @@ fn test_cloud_attribution_fallback_detects_claude_web() {
     let working_log = repo.current_working_logs();
     let checkpoints = working_log.read_all_checkpoints().unwrap();
 
-    let human_cp = checkpoints
-        .iter()
-        .find(|cp| cp.kind == git_ai::authorship::working_log::CheckpointKind::Human)
-        .expect("Should have a human checkpoint");
+    let cloud_cp = checkpoints
+        .last()
+        .expect("Should have a checkpoint");
 
-    assert!(human_cp.agent_id.is_some());
+    assert_eq!(cloud_cp.kind, git_ai::authorship::working_log::CheckpointKind::AiAgent);
+    assert!(cloud_cp.agent_id.is_some());
 
-    let agent_id = human_cp.agent_id.as_ref().unwrap();
+    let agent_id = cloud_cp.agent_id.as_ref().unwrap();
     assert_eq!(
         agent_id.tool, "claude-web",
         "Fallback should detect claude-web from CLAUDE_CODE_REMOTE=true"
@@ -279,15 +285,18 @@ fn test_cloud_attribution_uses_most_recent_of_multiple_ai_checkpoints() {
     let working_log = repo.current_working_logs();
     let checkpoints = working_log.read_all_checkpoints().unwrap();
 
-    let human_cp = checkpoints
-        .iter()
-        .rev()
-        .find(|cp| cp.kind == git_ai::authorship::working_log::CheckpointKind::Human)
-        .expect("Should have a human checkpoint");
+    let cloud_cp = checkpoints
+        .last()
+        .expect("Should have checkpoints");
 
+    assert_eq!(
+        cloud_cp.kind,
+        git_ai::authorship::working_log::CheckpointKind::AiAgent,
+        "Cloud-attributed checkpoint should have AiAgent kind"
+    );
     assert!(
-        human_cp.agent_id.is_some(),
-        "Human checkpoint should have agent_id from most recent AI checkpoint"
+        cloud_cp.agent_id.is_some(),
+        "Cloud-attributed checkpoint should have agent_id from most recent AI checkpoint"
     );
 }
 
@@ -383,19 +392,22 @@ fn test_feature_flag_injection_via_test_repo() {
     let working_log = repo.current_working_logs();
     let checkpoints = working_log.read_all_checkpoints().unwrap();
 
-    let human_cp = checkpoints
-        .iter()
-        .rev()
-        .find(|cp| cp.kind == git_ai::authorship::working_log::CheckpointKind::Human)
-        .expect("Should have a human checkpoint");
+    let cloud_cp = checkpoints
+        .last()
+        .expect("Should have a checkpoint");
 
-    // The flag is enabled via feature flag injection, so the fallback should work
+    // The flag is enabled via feature flag injection, so checkpoint is promoted to AiAgent
+    assert_eq!(
+        cloud_cp.kind,
+        git_ai::authorship::working_log::CheckpointKind::AiAgent,
+        "Feature flag injection should promote to AiAgent kind"
+    );
     assert!(
-        human_cp.agent_id.is_some(),
+        cloud_cp.agent_id.is_some(),
         "Feature flag injection should work through TestRepo - expected fallback agent_id"
     );
 
-    let agent_id = human_cp.agent_id.as_ref().unwrap();
+    let agent_id = cloud_cp.agent_id.as_ref().unwrap();
     assert_eq!(agent_id.id, "cloud-default");
 }
 
@@ -421,14 +433,14 @@ fn test_cloud_attribution_fallback_detects_generic_cloud_agent_prefix() {
     let working_log = repo.current_working_logs();
     let checkpoints = working_log.read_all_checkpoints().unwrap();
 
-    let human_cp = checkpoints
-        .iter()
-        .find(|cp| cp.kind == git_ai::authorship::working_log::CheckpointKind::Human)
-        .expect("Should have a human checkpoint");
+    let cloud_cp = checkpoints
+        .last()
+        .expect("Should have a checkpoint");
 
-    assert!(human_cp.agent_id.is_some());
+    assert_eq!(cloud_cp.kind, git_ai::authorship::working_log::CheckpointKind::AiAgent);
+    assert!(cloud_cp.agent_id.is_some());
 
-    let agent_id = human_cp.agent_id.as_ref().unwrap();
+    let agent_id = cloud_cp.agent_id.as_ref().unwrap();
     assert_eq!(
         agent_id.tool, "cloud-agent",
         "Fallback should detect 'cloud-agent' from CLOUD_AGENT_* prefix env var"
