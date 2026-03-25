@@ -353,6 +353,7 @@ pub fn run_with_captured_cloud_env_tool(
         is_pre_commit,
         None,
         BaseOverrideResolutionPolicy::AllowFallback,
+        captured_cloud_env_tool.as_deref(),
     )?;
     let Some(resolved) = resolved else {
         debug_log(&format!(
@@ -421,6 +422,7 @@ pub(crate) fn run_with_base_commit_override_with_policy(
         is_pre_commit,
         base_commit_override,
         base_override_resolution_policy,
+        None,
     )?;
     let Some(resolved) = resolved else {
         debug_log(&format!(
@@ -543,6 +545,7 @@ fn resolve_live_checkpoint_execution(
     is_pre_commit: bool,
     base_commit_override: Option<&str>,
     base_override_resolution_policy: BaseOverrideResolutionPolicy,
+    captured_cloud_env_tool: Option<&str>,
 ) -> Result<Option<ResolvedCheckpointExecution>, GitAiError> {
     let base_commit = resolve_base_commit(repo, base_commit_override);
 
@@ -579,6 +582,7 @@ fn resolve_live_checkpoint_execution(
             && !Config::get()
                 .get_feature_flags()
                 .cloud_default_ai_attribution
+            && captured_cloud_env_tool.is_none()
         {
             debug_log("No AI edits in pre-commit checkpoint, skipping");
             return Ok(None);
@@ -922,6 +926,7 @@ pub fn prepare_captured_checkpoint(
         is_pre_commit,
         base_commit_override,
         BaseOverrideResolutionPolicy::AllowFallback,
+        None, // captured-async: cloud env tool is resolved later in the manifest
     )?
     else {
         return Ok(None);
