@@ -1853,6 +1853,8 @@ impl TestRepo {
                 self.daemon_trace_socket_path(),
             );
         }
+
+        self.inject_feature_flag_env(command);
     }
 
     fn configure_git_ai_env(&self, command: &mut Command) {
@@ -1874,6 +1876,49 @@ impl TestRepo {
 
         if self.git_mode.uses_hooks() {
             command.env("GIT_AI_GLOBAL_GIT_HOOKS", "true");
+        }
+
+        self.inject_feature_flag_env(command);
+    }
+
+    /// Inject feature flag values as GIT_AI_* environment variables into the
+    /// spawned command so that per-TestRepo flag overrides are propagated to
+    /// the child git-ai process without polluting the global environment.
+    fn inject_feature_flag_env(&self, command: &mut Command) {
+        let flags = &self.feature_flags;
+        let defaults = FeatureFlags::default();
+
+        // Always inject cloud_default_ai_attribution because config.rs has
+        // auto-detection that would override the default (false) when running
+        // in a cloud env. We must always set the env var so the spawned
+        // process respects the test's explicit choice.
+        command.env(
+            "GIT_AI_CLOUD_DEFAULT_AI_ATTRIBUTION",
+            flags.cloud_default_ai_attribution.to_string(),
+        );
+        if flags.rewrite_stash != defaults.rewrite_stash {
+            command.env("GIT_AI_REWRITE_STASH", flags.rewrite_stash.to_string());
+        }
+        if flags.inter_commit_move != defaults.inter_commit_move {
+            command.env(
+                "GIT_AI_CHECKPOINT_INTER_COMMIT_MOVE",
+                flags.inter_commit_move.to_string(),
+            );
+        }
+        if flags.auth_keyring != defaults.auth_keyring {
+            command.env("GIT_AI_AUTH_KEYRING", flags.auth_keyring.to_string());
+        }
+        if flags.git_hooks_enabled != defaults.git_hooks_enabled {
+            command.env(
+                "GIT_AI_GIT_HOOKS_ENABLED",
+                flags.git_hooks_enabled.to_string(),
+            );
+        }
+        if flags.git_hooks_externally_managed != defaults.git_hooks_externally_managed {
+            command.env(
+                "GIT_AI_GIT_HOOKS_EXTERNALLY_MANAGED",
+                flags.git_hooks_externally_managed.to_string(),
+            );
         }
     }
 

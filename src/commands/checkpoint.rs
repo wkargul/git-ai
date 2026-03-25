@@ -8,7 +8,7 @@ use crate::authorship::ignore::{
 };
 use crate::authorship::imara_diff_utils::{LineChangeTag, compute_line_changes};
 use crate::authorship::working_log::CheckpointKind;
-use crate::authorship::working_log::{Checkpoint, WorkingLogEntry};
+use crate::authorship::working_log::{AgentId, Checkpoint, WorkingLogEntry};
 use crate::commands::blame::{GitAiBlameOptions, OLDEST_AI_BLAME_DATE};
 use crate::commands::checkpoint_agent::agent_presets::AgentRunResult;
 use crate::config::Config;
@@ -41,8 +41,6 @@ struct PreviousFileState {
     blob_sha: String,
     attributions: Vec<Attribution>,
 }
-
-use crate::authorship::working_log::AgentId;
 
 /// Emit at most one `agent_usage` metric per prompt every 2.5 minutes.
 /// This is half of the server-side bucketing window.
@@ -526,6 +524,9 @@ fn resolve_live_checkpoint_execution(
         if has_no_ai_edits
             && !has_initial_attributions
             && !Config::get().get_feature_flags().inter_commit_move
+            && !Config::get()
+                .get_feature_flags()
+                .cloud_default_ai_attribution
         {
             debug_log("No AI edits in pre-commit checkpoint, skipping");
             return Ok(None);
@@ -689,7 +690,7 @@ fn execute_resolved_checkpoint(
     ));
 
     let entries_start = Instant::now();
-    let (entries, file_stats) = smol::block_on(get_checkpoint_entries(
+    let (entries, file_stats, cloud_agent_id) = smol::block_on(get_checkpoint_entries(
         kind,
         repo,
         &working_log,
@@ -724,6 +725,12 @@ fn execute_resolved_checkpoint(
             checkpoint.transcript = Some(agent_run.transcript.clone().unwrap_or_default());
             checkpoint.agent_id = Some(agent_run.agent_id.clone());
             checkpoint.agent_metadata = agent_run.agent_metadata.clone();
+        }
+
+        // When cloud_default_ai_attribution is enabled, set agent_id on human checkpoints
+        // so the working log records the attributed agent identity.
+        if let Some(cloud_aid) = &cloud_agent_id {
+            checkpoint.agent_id = Some(cloud_aid.clone());
         }
         debug_log(&format!(
             "[BENCHMARK] Checkpoint creation took {:?}",
@@ -1633,6 +1640,66 @@ fn get_checkpoint_entry_for_file(
     Ok(Some((entry, stats)))
 }
 
+/// Detect the cloud environment tool name from environment variables.
+/// Returns a tool name like "cursor-agent", "claude-web", "devin", or "unknown".
+fn detect_cloud_env_tool() -> String {
+    // Explicit CLOUD_AGENT_TOOL env var takes highest priority
+    if let Ok(tool) = std::env::var("CLOUD_AGENT_TOOL")
+        && !tool.is_empty()
+    {
+        return tool;
+    }
+    // Check specific agent env vars
+    if std::env::var("CURSOR_AGENT")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+    {
+        return "cursor-agent".to_string();
+    }
+    if std::env::var("CLAUDE_CODE_REMOTE")
+        .map(|v| v == "true")
+        .unwrap_or(false)
+    {
+        return "claude-web".to_string();
+    }
+    // Check for any CLOUD_AGENT_* prefix env var (excluding CLOUD_AGENT_TOOL already handled)
+    if std::env::vars().any(|(k, _)| k.starts_with("CLOUD_AGENT_") && k != "CLOUD_AGENT_TOOL") {
+        return "cloud-agent".to_string();
+    }
+    // Path-based detection
+    if std::path::Path::new("/opt/.devin").is_dir() {
+        return "devin".to_string();
+    }
+    "unknown".to_string()
+}
+
+/// When cloud_default_ai_attribution is enabled, resolve the effective agent_id
+/// and author_id for a human checkpoint by looking at previous AI checkpoints
+/// or falling back to cloud env detection.
+fn resolve_cloud_attribution_for_human(previous_checkpoints: &[Checkpoint]) -> (AgentId, String) {
+    // Find the most recent AI checkpoint (iterate in reverse)
+    let most_recent_ai = previous_checkpoints
+        .iter()
+        .rev()
+        .find(|cp| cp.kind != CheckpointKind::Human && cp.agent_id.is_some());
+
+    if let Some(ai_checkpoint) = most_recent_ai {
+        let agent_id = ai_checkpoint.agent_id.clone().unwrap();
+        let author_id = generate_short_hash(&agent_id.id, &agent_id.tool);
+        return (agent_id, author_id);
+    }
+
+    // No previous AI checkpoint - detect cloud env tool
+    let tool = detect_cloud_env_tool();
+    let agent_id = AgentId {
+        tool,
+        id: "cloud-default".to_string(),
+        model: "unknown".to_string(),
+    };
+    let author_id = generate_short_hash(&agent_id.id, &agent_id.tool);
+    (agent_id, author_id)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn get_checkpoint_entries(
     kind: CheckpointKind,
@@ -1645,7 +1712,7 @@ async fn get_checkpoint_entries(
     ts: u128,
     is_pre_commit: bool,
     head_commit_override: Option<&str>,
-) -> Result<(Vec<WorkingLogEntry>, Vec<FileLineStats>), GitAiError> {
+) -> Result<(Vec<WorkingLogEntry>, Vec<FileLineStats>, Option<AgentId>), GitAiError> {
     let entries_fn_start = Instant::now();
 
     // Read INITIAL attributions from working log (empty if file doesn't exist)
@@ -1674,8 +1741,22 @@ async fn get_checkpoint_entries(
         precompute_start.elapsed()
     ));
 
-    // Determine author_id based on checkpoint kind and agent_id
-    let author_id = if kind != CheckpointKind::Human {
+    // Determine author_id based on checkpoint kind and agent_id.
+    // When cloud_default_ai_attribution is enabled and this is a human checkpoint,
+    // attribute changes to the most recent AI checkpoint's agent instead.
+    let cloud_attribution = if kind == CheckpointKind::Human
+        && Config::get()
+            .get_feature_flags()
+            .cloud_default_ai_attribution
+    {
+        Some(resolve_cloud_attribution_for_human(previous_checkpoints))
+    } else {
+        None
+    };
+
+    let author_id = if let Some((_, ref cloud_author_id)) = cloud_attribution {
+        cloud_author_id.clone()
+    } else if kind != CheckpointKind::Human {
         // For AI checkpoints, use session hash
         agent_run_result
             .map(|result| {
@@ -1686,7 +1767,7 @@ async fn get_checkpoint_entries(
             })
             .unwrap_or_else(|| kind.to_str())
     } else {
-        // For human checkpoints, use checkpoint kind string
+        // For human checkpoints without cloud attribution, use checkpoint kind string
         kind.to_str()
     };
 
@@ -1810,7 +1891,8 @@ async fn get_checkpoint_entries(
         entries_fn_start.elapsed()
     ));
 
-    Ok((entries, file_stats))
+    let resolved_agent_id = cloud_attribution.map(|(agent_id, _)| agent_id);
+    Ok((entries, file_stats, resolved_agent_id))
 }
 
 struct FileEntryInput<'a> {
