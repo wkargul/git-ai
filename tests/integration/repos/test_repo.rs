@@ -1362,7 +1362,7 @@ impl TestRepo {
         }
         if feature_flags.inter_commit_move != defaults.inter_commit_move {
             flags_json.insert(
-                "inter_commit_move".to_string(),
+                "checkpoint_inter_commit_move".to_string(),
                 serde_json::Value::Bool(feature_flags.inter_commit_move),
             );
         }

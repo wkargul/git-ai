@@ -1468,7 +1468,15 @@ fn get_checkpoint_entry_for_file(
     // Non-pre-commit fast path:
     // Preserve existing `git-ai checkpoint` behavior for human-only files by writing an
     // attribution-empty entry while still capturing line stats.
-    if kind == CheckpointKind::Human && !has_prior_ai_edits && initial_attrs_for_file.is_empty() {
+    // Exception: when cloud_default_ai_attribution is enabled, we need to run the full
+    // attribution pipeline so human edits are attributed to the most recent AI agent.
+    if kind == CheckpointKind::Human
+        && !has_prior_ai_edits
+        && initial_attrs_for_file.is_empty()
+        && !Config::get()
+            .get_feature_flags()
+            .cloud_default_ai_attribution
+    {
         let previous_content = if let Some(state) = previous_state.as_ref() {
             working_log
                 .get_file_version(&state.blob_sha)
