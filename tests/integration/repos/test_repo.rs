@@ -1384,6 +1384,12 @@ impl TestRepo {
                 serde_json::Value::Bool(feature_flags.git_hooks_externally_managed),
             );
         }
+        if feature_flags.async_mode != defaults.async_mode {
+            flags_json.insert(
+                "async_mode".to_string(),
+                serde_json::Value::Bool(feature_flags.async_mode),
+            );
+        }
         if !flags_json.is_empty() {
             self.patch_git_ai_config(|patch| {
                 let existing = patch
@@ -1986,6 +1992,9 @@ impl TestRepo {
                 "GIT_AI_GIT_HOOKS_EXTERNALLY_MANAGED",
                 flags.git_hooks_externally_managed.to_string(),
             );
+        }
+        if flags.async_mode != defaults.async_mode {
+            command.env("GIT_AI_ASYNC_MODE", flags.async_mode.to_string());
         }
     }
 
