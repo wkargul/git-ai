@@ -1,6 +1,6 @@
 use crate::git::refs::{
-    AI_AUTHORSHIP_PUSH_REFSPEC, copy_ref, fallback_merge_notes_ours, merge_notes_from_ref,
-    ref_exists, tracking_ref_for_remote,
+    AI_AUTHORSHIP_PUSH_REFSPEC, AI_SHARDED_NOTES_PREFIX, copy_ref, fallback_merge_notes_ours,
+    merge_notes_from_ref, ref_exists, tracking_ref_for_remote,
 };
 use crate::{
     error::GitAiError,
@@ -18,6 +18,112 @@ fn disabled_hooks_config() -> &'static str {
 #[cfg(not(windows))]
 fn disabled_hooks_config() -> &'static str {
     "core.hooksPath=/dev/null"
+}
+
+fn sharded_notes_enabled() -> bool {
+    crate::config::Config::get()
+        .get_feature_flags()
+        .sharded_notes
+}
+
+/// Tracking ref prefix for sharded notes from a specific remote.
+/// e.g. "refs/notes/ai-s-remote/origin/ab"
+fn shard_tracking_ref_prefix(remote_name: &str) -> String {
+    format!(
+        "refs/notes/ai-s-remote/{}/",
+        sanitize_remote_name_for_ref(remote_name)
+    )
+}
+
+/// Sanitize a remote name for use in a ref path (same logic as refs.rs).
+fn sanitize_remote_name_for_ref(remote: &str) -> String {
+    remote
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// List all shard tracking refs for a remote (refs/notes/ai-s-remote/<remote>/*).
+fn list_shard_tracking_refs(
+    repository: &Repository,
+    remote_name: &str,
+) -> Result<Vec<(String, String)>, GitAiError> {
+    let prefix = shard_tracking_ref_prefix(remote_name);
+    let mut args = repository.global_args_for_exec();
+    args.push("for-each-ref".to_string());
+    args.push("--format=%(refname)".to_string());
+    args.push(prefix.clone());
+
+    match exec_git(&args) {
+        Ok(output) => {
+            let stdout = String::from_utf8(output.stdout)
+                .map_err(|_| GitAiError::Generic("bad utf8".to_string()))?;
+            Ok(stdout
+                .lines()
+                .filter(|l| !l.is_empty())
+                .filter_map(|tracking_ref| {
+                    // Extract shard suffix (e.g. "ab") from tracking ref
+                    let shard = tracking_ref.strip_prefix(&prefix)?;
+                    let local_shard_ref = format!("{}{}", AI_SHARDED_NOTES_PREFIX, shard);
+                    Some((tracking_ref.to_string(), local_shard_ref))
+                })
+                .collect())
+        }
+        Err(_) => Ok(Vec::new()),
+    }
+}
+
+/// Merge all shard tracking refs into their corresponding local shard refs.
+fn merge_shard_tracking_refs(repository: &Repository, remote_name: &str) {
+    let shard_refs = match list_shard_tracking_refs(repository, remote_name) {
+        Ok(refs) => refs,
+        Err(e) => {
+            debug_log(&format!("failed to list shard tracking refs: {}", e));
+            return;
+        }
+    };
+
+    for (tracking_ref, local_shard_ref) in &shard_refs {
+        if !ref_exists(repository, tracking_ref) {
+            continue;
+        }
+
+        if ref_exists(repository, local_shard_ref) {
+            // Both exist — merge using notes merge -s ours on the shard ref
+            let shard_name = local_shard_ref
+                .strip_prefix("refs/notes/")
+                .unwrap_or(local_shard_ref);
+            let mut args = repository.global_args_for_exec();
+            args.push("notes".to_string());
+            args.push(format!("--ref={}", shard_name));
+            args.push("merge".to_string());
+            args.push("-s".to_string());
+            args.push("ours".to_string());
+            args.push("--quiet".to_string());
+            args.push(tracking_ref.to_string());
+
+            if let Err(e) = exec_git(&args) {
+                debug_log(&format!(
+                    "shard merge failed for {} <- {}: {}",
+                    local_shard_ref, tracking_ref, e
+                ));
+            }
+        } else {
+            // Only tracking ref exists — copy it to local
+            if let Err(e) = copy_ref(repository, tracking_ref, local_shard_ref) {
+                debug_log(&format!(
+                    "shard copy failed for {} <- {}: {}",
+                    local_shard_ref, tracking_ref, e
+                ));
+            }
+        }
+    }
 }
 
 /// Result of checking for authorship notes on a remote
@@ -84,17 +190,19 @@ pub fn fetch_authorship_notes(
         remote_name, tracking_ref
     ));
 
-    // Fetch notes to tracking ref with explicit refspec.
-    // If the remote does not have refs/notes/ai yet, treat that as NotFound.
+    // Build refspecs: legacy + shard wildcard (when enabled)
     let fetch_refspec = format!("+refs/notes/ai:{}", tracking_ref);
+    let mut refspecs = vec![fetch_refspec.as_str()];
 
-    // Build the internal authorship fetch with explicit flags and disabled hooks.
-    // IMPORTANT: use repository.global_args_for_exec() to ensure -C flag is present for bare repos.
-    let fetch_authorship = build_authorship_fetch_args(
-        repository.global_args_for_exec(),
-        remote_name,
-        &fetch_refspec,
-    );
+    let shard_prefix = shard_tracking_ref_prefix(remote_name);
+    let shard_refspec = format!("+{}*:{}*", AI_SHARDED_NOTES_PREFIX, shard_prefix);
+    let sharded = sharded_notes_enabled();
+    if sharded {
+        refspecs.push(&shard_refspec);
+    }
+
+    let fetch_authorship =
+        build_authorship_fetch_args(repository.global_args_for_exec(), remote_name, &refspecs);
 
     debug_log(&format!("fetch command: {:?}", fetch_authorship));
 
@@ -127,7 +235,6 @@ pub fn fetch_authorship_notes(
 
     if crate::git::refs::ref_exists(repository, &tracking_ref) {
         if crate::git::refs::ref_exists(repository, local_notes_ref) {
-            // Both exist - merge them
             debug_log(&format!(
                 "merging authorship notes from {} into {}",
                 tracking_ref, local_notes_ref
@@ -140,14 +247,12 @@ pub fn fetch_authorship_notes(
                 }
             }
         } else {
-            // Only tracking ref exists - copy it to local
             debug_log(&format!(
                 "initializing {} from tracking ref {}",
                 local_notes_ref, tracking_ref
             ));
             if let Err(e) = copy_ref(repository, &tracking_ref, local_notes_ref) {
                 debug_log(&format!("notes copy failed: {}", e));
-                // Don't fail on copy errors, just log and continue
             }
         }
     } else {
@@ -155,6 +260,11 @@ pub fn fetch_authorship_notes(
             "tracking ref {} was not created after fetch",
             tracking_ref
         ));
+    }
+
+    // Merge shard tracking refs when sharding is enabled
+    if sharded {
+        merge_shard_tracking_refs(repository, remote_name);
     }
 
     Ok(NotesExistence::Found)
@@ -193,7 +303,19 @@ pub fn push_authorship_notes(repository: &Repository, remote_name: &str) -> Resu
         fetch_and_merge_tracking_notes(repository, remote_name);
 
         // Push notes without force (requires fast-forward)
-        let push_args = build_authorship_push_args(repository.global_args_for_exec(), remote_name);
+        let sharded = sharded_notes_enabled();
+        let shard_push_refspec =
+            format!("{}*:{}*", AI_SHARDED_NOTES_PREFIX, AI_SHARDED_NOTES_PREFIX);
+        let mut push_refspecs: Vec<&str> = vec![AI_AUTHORSHIP_PUSH_REFSPEC];
+        if sharded {
+            push_refspecs.push(&shard_push_refspec);
+        }
+
+        let push_args = build_authorship_push_args(
+            repository.global_args_for_exec(),
+            remote_name,
+            &push_refspecs,
+        );
 
         debug_log(&format!(
             "pushing authorship refs (no force): {:?}",
@@ -221,14 +343,19 @@ pub fn push_authorship_notes(repository: &Repository, remote_name: &str) -> Resu
 
 /// Fetch remote notes into a tracking ref and merge into local refs/notes/ai.
 fn fetch_and_merge_tracking_notes(repository: &Repository, remote_name: &str) {
+    let sharded = sharded_notes_enabled();
     let tracking_ref = tracking_ref_for_remote(remote_name);
     let fetch_refspec = format!("+refs/notes/ai:{}", tracking_ref);
+    let mut refspecs = vec![fetch_refspec.as_str()];
 
-    let fetch_args = build_authorship_fetch_args(
-        repository.global_args_for_exec(),
-        remote_name,
-        &fetch_refspec,
-    );
+    let shard_prefix = shard_tracking_ref_prefix(remote_name);
+    let shard_fetch_refspec = format!("+{}*:{}*", AI_SHARDED_NOTES_PREFIX, shard_prefix);
+    if sharded {
+        refspecs.push(&shard_fetch_refspec);
+    }
+
+    let fetch_args =
+        build_authorship_fetch_args(repository.global_args_for_exec(), remote_name, &refspecs);
 
     debug_log(&format!("pre-push authorship fetch: {:?}", &fetch_args));
 
@@ -268,6 +395,11 @@ fn fetch_and_merge_tracking_notes(repository: &Repository, remote_name: &str) {
         if let Err(e2) = fallback_merge_notes_ours(repository, &tracking_ref) {
             debug_log(&format!("pre-push fallback merge also failed: {}", e2));
         }
+    }
+
+    // Merge shard tracking refs
+    if sharded {
+        merge_shard_tracking_refs(repository, remote_name);
     }
 }
 
@@ -338,7 +470,7 @@ fn with_disabled_hooks(mut args: Vec<String>) -> Vec<String> {
 fn build_authorship_fetch_args(
     global_args: Vec<String>,
     remote_name: &str,
-    fetch_refspec: &str,
+    fetch_refspecs: &[&str],
 ) -> Vec<String> {
     let mut args = with_disabled_hooks(global_args);
     args.push("fetch".to_string());
@@ -348,11 +480,17 @@ fn build_authorship_fetch_args(
     args.push("--no-write-commit-graph".to_string());
     args.push("--no-auto-maintenance".to_string());
     args.push(remote_name.to_string());
-    args.push(fetch_refspec.to_string());
+    for refspec in fetch_refspecs {
+        args.push(refspec.to_string());
+    }
     args
 }
 
-fn build_authorship_push_args(global_args: Vec<String>, remote_name: &str) -> Vec<String> {
+fn build_authorship_push_args(
+    global_args: Vec<String>,
+    remote_name: &str,
+    push_refspecs: &[&str],
+) -> Vec<String> {
     let mut args = with_disabled_hooks(global_args);
     args.push("push".to_string());
     args.push("--quiet".to_string());
@@ -360,7 +498,9 @@ fn build_authorship_push_args(global_args: Vec<String>, remote_name: &str) -> Ve
     args.push("--no-verify".to_string());
     args.push("--no-signed".to_string());
     args.push(remote_name.to_string());
-    args.push(AI_AUTHORSHIP_PUSH_REFSPEC.to_string());
+    for refspec in push_refspecs {
+        args.push(refspec.to_string());
+    }
     args
 }
 
@@ -374,7 +514,7 @@ mod tests {
         let args = build_authorship_fetch_args(
             vec!["-C".to_string(), "/tmp/repo".to_string()],
             "origin",
-            "+refs/notes/ai:refs/notes/ai-remote/origin",
+            &["+refs/notes/ai:refs/notes/ai-remote/origin"],
         );
 
         assert!(
@@ -387,8 +527,11 @@ mod tests {
     #[test]
     fn authorship_push_args_always_disable_hooks() {
         let disabled_hooks = disabled_hooks_config();
-        let args =
-            build_authorship_push_args(vec!["-C".to_string(), "/tmp/repo".to_string()], "origin");
+        let args = build_authorship_push_args(
+            vec!["-C".to_string(), "/tmp/repo".to_string()],
+            "origin",
+            &[AI_AUTHORSHIP_PUSH_REFSPEC],
+        );
 
         assert!(
             args.windows(2)
