@@ -729,12 +729,8 @@ fn execute_resolved_checkpoint(
         let line_stats_agg = compute_line_stats(&file_stats)?;
 
         // Move entries into the checkpoint to avoid cloning
-        let mut checkpoint = Checkpoint::new(
-            kind,
-            combined_hash.clone(),
-            author.to_string(),
-            entries,
-        );
+        let mut checkpoint =
+            Checkpoint::new(kind, combined_hash.clone(), author.to_string(), entries);
         checkpoint.timestamp = checkpoint_ts;
         checkpoint.line_stats = line_stats_agg;
 
@@ -785,8 +781,7 @@ fn execute_resolved_checkpoint(
             append_start.elapsed()
         ));
 
-        let attrs =
-            build_checkpoint_attrs(repo, &resolved.base_commit, cp_agent_id.as_ref());
+        let attrs = build_checkpoint_attrs(repo, &resolved.base_commit, cp_agent_id.as_ref());
 
         if kind != CheckpointKind::Human
             && let Some(agent_id) = cp_agent_id.as_ref()
@@ -1132,6 +1127,7 @@ fn get_status_of_files(
 
 /// Get all files that should be tracked, including those from previous checkpoints and INITIAL attributions
 ///
+#[allow(clippy::too_many_arguments)]
 fn get_all_tracked_files(
     repo: &Repository,
     _base_commit: &str,
@@ -1230,21 +1226,20 @@ fn get_all_tracked_files(
     let status_files_start = Instant::now();
     // Fast path: when we have dirty_files, all explicit paths are known-changed.
     // Skip the expensive git status call if every file in our set is covered by dirty_files.
-    let mut results_for_tracked_files =
-        if let Some(ref dirty_files) = working_log.dirty_files {
-            if !dirty_files.is_empty() && files.iter().all(|f| dirty_files.contains_key(f)) {
-                debug_log("[BENCHMARK]   Skipping git status (all files covered by dirty_files)");
-                files.into_iter().collect()
-            } else if is_pre_commit && !has_ai_checkpoints {
-                get_status_of_files(repo, working_log, files, true, ignore_matcher)?
-            } else {
-                get_status_of_files(repo, working_log, files, false, ignore_matcher)?
-            }
+    let mut results_for_tracked_files = if let Some(ref dirty_files) = working_log.dirty_files {
+        if !dirty_files.is_empty() && files.iter().all(|f| dirty_files.contains_key(f)) {
+            debug_log("[BENCHMARK]   Skipping git status (all files covered by dirty_files)");
+            files.into_iter().collect()
         } else if is_pre_commit && !has_ai_checkpoints {
             get_status_of_files(repo, working_log, files, true, ignore_matcher)?
         } else {
             get_status_of_files(repo, working_log, files, false, ignore_matcher)?
-        };
+        }
+    } else if is_pre_commit && !has_ai_checkpoints {
+        get_status_of_files(repo, working_log, files, true, ignore_matcher)?
+    } else {
+        get_status_of_files(repo, working_log, files, false, ignore_matcher)?
+    };
     debug_log(&format!(
         "[BENCHMARK]   get_status_of_files in get_all_tracked_files took {:?}",
         status_files_start.elapsed()
@@ -1965,14 +1960,15 @@ fn make_entry_for_file(
     let update_start = Instant::now();
     // Use the _with_stats variant to get line stats from the same diff computation,
     // avoiding a redundant second diff pass in compute_file_line_stats.
-    let (new_attributions, diff_line_stats) = tracker.update_attributions_for_checkpoint_with_stats(
-        previous_content,
-        content,
-        &filled_in_prev_attributions,
-        author_id,
-        ts,
-        is_ai_checkpoint,
-    )?;
+    let (new_attributions, diff_line_stats) = tracker
+        .update_attributions_for_checkpoint_with_stats(
+            previous_content,
+            content,
+            &filled_in_prev_attributions,
+            author_id,
+            ts,
+            is_ai_checkpoint,
+        )?;
     debug_log(&format!(
         "[BENCHMARK]   update_attributions_with_stats for {} took {:?}",
         file_path,

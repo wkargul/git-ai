@@ -366,43 +366,50 @@ impl AttributionTracker {
             } else {
                 // Accumulate line stats from non-equal ops
                 match &op {
-                    DiffOp::Delete { old_index, old_len, .. } => {
-                        let count = *old_len as u32;
-                        computation.line_stats.deletions += count;
+                    DiffOp::Delete {
+                        old_index, old_len, ..
+                    } => {
+                        computation.line_stats.deletions += *old_len as u32;
                         for i in *old_index..(*old_index + *old_len) {
-                            if let Some(line) = old_lines.get(i) {
-                                if !line.text.trim().is_empty() {
-                                    computation.line_stats.deletions_sloc += 1;
-                                }
+                            if let Some(line) = old_lines.get(i)
+                                && !line.text.trim().is_empty()
+                            {
+                                computation.line_stats.deletions_sloc += 1;
                             }
                         }
                     }
-                    DiffOp::Insert { new_index, new_len, .. } => {
-                        let count = *new_len as u32;
-                        computation.line_stats.additions += count;
+                    DiffOp::Insert {
+                        new_index, new_len, ..
+                    } => {
+                        computation.line_stats.additions += *new_len as u32;
                         for i in *new_index..(*new_index + *new_len) {
-                            if let Some(line) = new_lines.get(i) {
-                                if !line.text.trim().is_empty() {
-                                    computation.line_stats.additions_sloc += 1;
-                                }
+                            if let Some(line) = new_lines.get(i)
+                                && !line.text.trim().is_empty()
+                            {
+                                computation.line_stats.additions_sloc += 1;
                             }
                         }
                     }
-                    DiffOp::Replace { old_index, old_len, new_index, new_len } => {
+                    DiffOp::Replace {
+                        old_index,
+                        old_len,
+                        new_index,
+                        new_len,
+                    } => {
                         computation.line_stats.deletions += *old_len as u32;
                         computation.line_stats.additions += *new_len as u32;
                         for i in *old_index..(*old_index + *old_len) {
-                            if let Some(line) = old_lines.get(i) {
-                                if !line.text.trim().is_empty() {
-                                    computation.line_stats.deletions_sloc += 1;
-                                }
+                            if let Some(line) = old_lines.get(i)
+                                && !line.text.trim().is_empty()
+                            {
+                                computation.line_stats.deletions_sloc += 1;
                             }
                         }
                         for i in *new_index..(*new_index + *new_len) {
-                            if let Some(line) = new_lines.get(i) {
-                                if !line.text.trim().is_empty() {
-                                    computation.line_stats.additions_sloc += 1;
-                                }
+                            if let Some(line) = new_lines.get(i)
+                                && !line.text.trim().is_empty()
+                            {
+                                computation.line_stats.additions_sloc += 1;
                             }
                         }
                     }
@@ -579,11 +586,11 @@ impl AttributionTracker {
         // Merge overlapping intervals
         let mut merged: Vec<(usize, usize)> = Vec::with_capacity(intervals.len());
         for (s, e) in intervals {
-            if let Some(last) = merged.last_mut() {
-                if s <= last.1 {
-                    last.1 = last.1.max(e);
-                    continue;
-                }
+            if let Some(last) = merged.last_mut()
+                && s <= last.1
+            {
+                last.1 = last.1.max(e);
+                continue;
             }
             merged.push((s, e));
         }
@@ -596,23 +603,13 @@ impl AttributionTracker {
             if pos < start && pos < content_len {
                 // Gap before this interval — attribute it
                 let gap_end = start.min(content_len);
-                new_attributions.push(Attribution::new(
-                    pos,
-                    gap_end,
-                    author.to_string(),
-                    ts,
-                ));
+                new_attributions.push(Attribution::new(pos, gap_end, author.to_string(), ts));
             }
             pos = end;
         }
         // Gap after the last interval
         if pos < content_len {
-            new_attributions.push(Attribution::new(
-                pos,
-                content_len,
-                author.to_string(),
-                ts,
-            ));
+            new_attributions.push(Attribution::new(pos, content_len, author.to_string(), ts));
         }
 
         let mut result = prev_attributions.to_vec();

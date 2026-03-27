@@ -387,7 +387,7 @@ impl PersistedWorkingLog {
     /// rewrite when pruning modifies earlier entries.
     pub fn append_checkpoint_with_existing(
         &self,
-        checkpoints: &mut Vec<Checkpoint>,
+        checkpoints: &mut [Checkpoint],
     ) -> Result<(), GitAiError> {
         // Strip transcript from the last (new) checkpoint
         if let Some(last) = checkpoints.last() {

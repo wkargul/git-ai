@@ -37,7 +37,10 @@ fn print_stats(label: &str, durations: &[Duration]) {
 fn bench_single_file_ai_checkpoint(repo: &TestRepo, file_name: &str, iteration: usize) -> Duration {
     // Modify the file
     let file_path = repo.path().join(file_name);
-    let content = format!("ai generated line iteration {}\nmore code\nfunction foo() {{}}\n", iteration);
+    let content = format!(
+        "ai generated line iteration {}\nmore code\nfunction foo() {{}}\n",
+        iteration
+    );
     fs::write(&file_path, content).unwrap();
 
     let start = Instant::now();
@@ -47,9 +50,16 @@ fn bench_single_file_ai_checkpoint(repo: &TestRepo, file_name: &str, iteration: 
 }
 
 /// Benchmark: Human checkpoint on a single file
-fn bench_single_file_human_checkpoint(repo: &TestRepo, file_name: &str, iteration: usize) -> Duration {
+fn bench_single_file_human_checkpoint(
+    repo: &TestRepo,
+    file_name: &str,
+    iteration: usize,
+) -> Duration {
     let file_path = repo.path().join(file_name);
-    let content = format!("human edit iteration {}\nsome code\nfunction bar() {{}}\n", iteration);
+    let content = format!(
+        "human edit iteration {}\nsome code\nfunction bar() {{}}\n",
+        iteration
+    );
     fs::write(&file_path, content).unwrap();
 
     let start = Instant::now();
@@ -59,7 +69,11 @@ fn bench_single_file_human_checkpoint(repo: &TestRepo, file_name: &str, iteratio
 }
 
 /// Benchmark: AI agent checkpoint on multiple files (file-scoped, mock_ai)
-fn bench_multi_file_ai_checkpoint(repo: &TestRepo, file_count: usize, iteration: usize) -> Duration {
+fn bench_multi_file_ai_checkpoint(
+    repo: &TestRepo,
+    file_count: usize,
+    iteration: usize,
+) -> Duration {
     let mut file_names = Vec::with_capacity(file_count);
     for i in 0..file_count {
         let name = format!("src/module_{}.rs", i);
@@ -88,7 +102,10 @@ fn bench_multi_file_ai_checkpoint(repo: &TestRepo, file_count: usize, iteration:
 /// Benchmark: Claude agent checkpoint using real fixture
 fn bench_claude_checkpoint(repo: &TestRepo, file_name: &str, iteration: usize) -> Duration {
     let file_path = repo.path().join(file_name);
-    let content = format!("claude generated code iteration {}\nconst x = {};\n", iteration, iteration);
+    let content = format!(
+        "claude generated code iteration {}\nconst x = {};\n",
+        iteration, iteration
+    );
     fs::write(&file_path, content).unwrap();
 
     let transcript_path = fixture_path("example-claude-code.jsonl");
@@ -181,7 +198,10 @@ fn checkpoint_perf_benchmark_multi_file_ai() {
             let d = bench_multi_file_ai_checkpoint(&repo, file_count, i);
             durations.push(d);
         }
-        print_stats(&format!("multi_file_ai_checkpoint({}files)", file_count), &durations);
+        print_stats(
+            &format!("multi_file_ai_checkpoint({}files)", file_count),
+            &durations,
+        );
     }
 }
 
@@ -216,7 +236,11 @@ fn checkpoint_perf_benchmark_accumulated_history() {
             .collect();
         if !bucket.is_empty() {
             print_stats(
-                &format!("accumulated_history(checkpoints {}-{})", milestone - 4, milestone),
+                &format!(
+                    "accumulated_history(checkpoints {}-{})",
+                    milestone - 4,
+                    milestone
+                ),
                 &bucket,
             );
         }
