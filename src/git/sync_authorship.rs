@@ -4,7 +4,10 @@ use crate::git::refs::{
 };
 use crate::{
     error::GitAiError,
-    git::{cli_parser::ParsedGitInvocation, repository::exec_git},
+    git::{
+        cli_parser::ParsedGitInvocation,
+        repository::{exec_git, exec_git_stdin},
+    },
     utils::debug_log,
 };
 
@@ -49,79 +52,187 @@ fn sanitize_remote_name_for_ref(remote: &str) -> String {
         .collect()
 }
 
-/// List all shard tracking refs for a remote (refs/notes/ai-s-remote/<remote>/*).
-fn list_shard_tracking_refs(
+/// Resolved shard ref pair: tracking ref name, local ref name, and their resolved OIDs.
+struct ShardRefPair {
+    tracking_ref: String,
+    tracking_oid: String,
+    local_shard_ref: String,
+    local_oid: Option<String>, // None means local doesn't exist yet
+}
+
+/// Discover shard tracking refs and resolve both tracking and local OIDs in a single
+/// `for-each-ref` + `cat-file --batch-check` round-trip pair (2 git processes total,
+/// regardless of shard count).
+fn resolve_shard_ref_pairs(
     repository: &Repository,
     remote_name: &str,
-) -> Result<Vec<(String, String)>, GitAiError> {
+) -> Result<Vec<ShardRefPair>, GitAiError> {
     let prefix = shard_tracking_ref_prefix(remote_name);
+
+    // 1. List tracking refs with their OIDs in one call
     let mut args = repository.global_args_for_exec();
     args.push("for-each-ref".to_string());
-    args.push("--format=%(refname)".to_string());
+    args.push("--format=%(objectname) %(refname)".to_string());
     args.push(prefix.clone());
 
-    match exec_git(&args) {
-        Ok(output) => {
-            let stdout = String::from_utf8(output.stdout)
-                .map_err(|_| GitAiError::Generic("bad utf8".to_string()))?;
-            Ok(stdout
-                .lines()
-                .filter(|l| !l.is_empty())
-                .filter_map(|tracking_ref| {
-                    // Extract shard suffix (e.g. "ab") from tracking ref
-                    let shard = tracking_ref.strip_prefix(&prefix)?;
-                    let local_shard_ref = format!("{}{}", AI_SHARDED_NOTES_PREFIX, shard);
-                    Some((tracking_ref.to_string(), local_shard_ref))
-                })
-                .collect())
-        }
-        Err(_) => Ok(Vec::new()),
+    let output = match exec_git(&args) {
+        Ok(o) => o,
+        Err(_) => return Ok(Vec::new()),
+    };
+    let stdout = String::from_utf8(output.stdout)
+        .map_err(|_| GitAiError::Generic("bad utf8".to_string()))?;
+
+    // Each entry: (tracking_oid, tracking_refname, local_shard_ref)
+    let tracking_refs: Vec<(String, String, String)> = stdout
+        .lines()
+        .filter(|l| !l.is_empty())
+        .filter_map(|line| {
+            let (oid, refname) = line.split_once(' ')?;
+            let shard = refname.strip_prefix(&prefix)?;
+            let local_ref = format!("{}{}", AI_SHARDED_NOTES_PREFIX, shard);
+            Some((oid.to_string(), refname.to_string(), local_ref))
+        })
+        .collect();
+
+    if tracking_refs.is_empty() {
+        return Ok(Vec::new());
     }
+
+    // 2. Batch-resolve all local shard ref OIDs in one cat-file call
+    let mut batch_args = repository.global_args_for_exec();
+    batch_args.push("cat-file".to_string());
+    batch_args.push("--batch-check".to_string());
+
+    let stdin_data: String = tracking_refs
+        .iter()
+        .map(|(_, _, local_ref)| local_ref.as_str())
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+
+    let batch_output = exec_git_stdin(&batch_args, stdin_data.as_bytes())?;
+    let batch_stdout = String::from_utf8(batch_output.stdout)
+        .map_err(|_| GitAiError::Generic("bad utf8".to_string()))?;
+
+    let pairs: Vec<ShardRefPair> = tracking_refs
+        .into_iter()
+        .zip(batch_stdout.lines())
+        .map(
+            |((tracking_oid, tracking_ref, local_shard_ref), batch_line)| {
+                // cat-file --batch-check output: "<oid> commit <size>" or "<ref> missing"
+                let local_oid = if batch_line.contains("missing") {
+                    None
+                } else {
+                    batch_line.split_whitespace().next().map(|s| s.to_string())
+                };
+                ShardRefPair {
+                    tracking_ref,
+                    tracking_oid,
+                    local_shard_ref,
+                    local_oid,
+                }
+            },
+        )
+        .collect();
+
+    Ok(pairs)
 }
 
 /// Merge all shard tracking refs into their corresponding local shard refs.
+///
+/// Optimized to minimize git process invocations:
+/// - 2 processes to discover and resolve all shard pairs (for-each-ref + cat-file)
+/// - Skips shards where tracking == local (no change) — zero cost
+/// - Batches all "copy" operations (local doesn't exist) into one update-ref --stdin call
+/// - Only runs `git notes merge` for genuinely diverged shards (typically 1-2 per fetch)
 fn merge_shard_tracking_refs(repository: &Repository, remote_name: &str) {
-    let shard_refs = match list_shard_tracking_refs(repository, remote_name) {
-        Ok(refs) => refs,
+    let pairs = match resolve_shard_ref_pairs(repository, remote_name) {
+        Ok(p) => p,
         Err(e) => {
-            debug_log(&format!("failed to list shard tracking refs: {}", e));
+            debug_log(&format!("failed to resolve shard ref pairs: {}", e));
             return;
         }
     };
 
-    for (tracking_ref, local_shard_ref) in &shard_refs {
-        if !ref_exists(repository, tracking_ref) {
-            continue;
+    if pairs.is_empty() {
+        return;
+    }
+
+    // Partition into: copies (local doesn't exist) and merges (both exist, different OIDs)
+    let mut copies: Vec<(&str, &str)> = Vec::new(); // (local_ref, tracking_oid)
+    let mut merges: Vec<(&str, &str)> = Vec::new(); // (local_ref, tracking_ref)
+
+    for pair in &pairs {
+        match &pair.local_oid {
+            None => {
+                // Local doesn't exist — copy tracking OID
+                copies.push((&pair.local_shard_ref, &pair.tracking_oid));
+            }
+            Some(local_oid) if local_oid == &pair.tracking_oid => {
+                // Already in sync — skip
+            }
+            Some(_) => {
+                // Both exist, different — need merge
+                merges.push((&pair.local_shard_ref, &pair.tracking_ref));
+            }
+        }
+    }
+
+    debug_log(&format!(
+        "shard merge: {} unchanged, {} copies, {} merges",
+        pairs.len() - copies.len() - merges.len(),
+        copies.len(),
+        merges.len(),
+    ));
+
+    // Batch all copies into one update-ref --stdin call
+    if !copies.is_empty() {
+        let mut args = repository.global_args_for_exec();
+        args.push("update-ref".to_string());
+        args.push("--stdin".to_string());
+
+        let mut stdin_data = String::new();
+        for (local_ref, tracking_oid) in &copies {
+            // "create <ref> <oid>\n" — sets ref to oid, fails if ref already exists
+            // (safe here because we confirmed local doesn't exist)
+            stdin_data.push_str(&format!("create {} {}\n", local_ref, tracking_oid));
         }
 
-        if ref_exists(repository, local_shard_ref) {
-            // Both exist — merge using notes merge -s ours on the shard ref
-            let shard_name = local_shard_ref
-                .strip_prefix("refs/notes/")
-                .unwrap_or(local_shard_ref);
-            let mut args = repository.global_args_for_exec();
-            args.push("notes".to_string());
-            args.push(format!("--ref={}", shard_name));
-            args.push("merge".to_string());
-            args.push("-s".to_string());
-            args.push("ours".to_string());
-            args.push("--quiet".to_string());
-            args.push(tracking_ref.to_string());
+        if let Err(e) = exec_git_stdin(&args, stdin_data.as_bytes()) {
+            debug_log(&format!("batch shard copy failed: {}", e));
+            // Fall back to individual copies
+            for (local_ref, _tracking_oid) in &copies {
+                // Find the matching pair to get the tracking ref name
+                if let Some(pair) = pairs.iter().find(|p| p.local_shard_ref == **local_ref) {
+                    if let Err(e) = copy_ref(repository, &pair.tracking_ref, local_ref) {
+                        debug_log(&format!(
+                            "shard copy failed for {} <- {}: {}",
+                            local_ref, pair.tracking_ref, e
+                        ));
+                    }
+                }
+            }
+        }
+    }
 
-            if let Err(e) = exec_git(&args) {
-                debug_log(&format!(
-                    "shard merge failed for {} <- {}: {}",
-                    local_shard_ref, tracking_ref, e
-                ));
-            }
-        } else {
-            // Only tracking ref exists — copy it to local
-            if let Err(e) = copy_ref(repository, tracking_ref, local_shard_ref) {
-                debug_log(&format!(
-                    "shard copy failed for {} <- {}: {}",
-                    local_shard_ref, tracking_ref, e
-                ));
-            }
+    // Merges: these are genuinely diverged shards — run notes merge per shard.
+    // Typically only 1-2 shards per fetch, so this is acceptable.
+    for (local_ref, tracking_ref) in &merges {
+        let shard_name = local_ref.strip_prefix("refs/notes/").unwrap_or(local_ref);
+        let mut args = repository.global_args_for_exec();
+        args.push("notes".to_string());
+        args.push(format!("--ref={}", shard_name));
+        args.push("merge".to_string());
+        args.push("-s".to_string());
+        args.push("ours".to_string());
+        args.push("--quiet".to_string());
+        args.push(tracking_ref.to_string());
+
+        if let Err(e) = exec_git(&args) {
+            debug_log(&format!(
+                "shard merge failed for {} <- {}: {}",
+                local_ref, tracking_ref, e
+            ));
         }
     }
 }
