@@ -162,6 +162,9 @@ fn test_commit_tree_update_ref_preserves_authorship_notes_on_reparent() {
         "feature commit",
     );
 
+    // Wait for daemon to process the update-ref rewrite event.
+    repo.sync_daemon_force();
+
     let git_ai_repo = open_repo(&repo);
     assert!(
         show_authorship_note(&git_ai_repo, &new_head).is_some(),
@@ -216,6 +219,8 @@ fn test_commit_tree_update_ref_moves_working_log_to_rewritten_head() {
         &main_commit.commit_sha,
         "feature commit",
     );
+
+    repo.sync_daemon_force();
 
     let git_ai_repo = open_repo(&repo);
     assert!(
@@ -279,6 +284,8 @@ fn test_reset_keep_rewrite_preserves_authorship_notes_on_current_branch() {
     repo.git(&["reset", "--keep", &new_head])
         .expect("git reset --keep should succeed");
 
+    repo.sync_daemon_force();
+
     let git_ai_repo = open_repo(&repo);
     assert!(
         show_authorship_note(&git_ai_repo, &new_head).is_some(),
@@ -339,6 +346,8 @@ fn test_update_ref_restack_after_parent_amend_preserves_child_attribution() {
         &amended_parent_head,
         "child",
     );
+
+    repo.sync_daemon_force();
 
     let git_ai_repo = open_repo(&repo);
     assert!(
