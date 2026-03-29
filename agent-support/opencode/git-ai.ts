@@ -102,7 +102,7 @@ export const GitAiPlugin: Plugin = async (ctx) => {
     "tool.execute.after": async (input, _output) => {
       // Only intercept file editing tools for checkpoints
       if (!FILE_EDIT_TOOLS.includes(input.tool)) {
-        // Still emit prompt-event for non-file-edit tools
+        // Still emit checkpoint (which includes prompt-event) for non-file-edit tools
         try {
           const hookInput = JSON.stringify({
             hook_event_name: "PostToolUse",
@@ -110,9 +110,9 @@ export const GitAiPlugin: Plugin = async (ctx) => {
             cwd: process.cwd(),
             tool_input: { toolName: input.tool },
           })
-          await $`echo ${hookInput} | ${GIT_AI_BIN} prompt-event opencode --hook-input stdin`.quiet()
+          await $`echo ${hookInput} | ${GIT_AI_BIN} checkpoint opencode --hook-input stdin`.quiet()
         } catch {
-          // Best-effort, don't log for prompt events
+          // Best-effort
         }
         return
       }
@@ -142,19 +142,6 @@ export const GitAiPlugin: Plugin = async (ctx) => {
       } catch (error) {
         // Log to stderr for debugging, but don't throw - git-ai errors shouldn't break the agent
         console.error("[git-ai] Failed to create AI checkpoint:", String(error))
-      }
-
-      // Also emit prompt event for file-edit tool calls
-      try {
-        const promptHookInput = JSON.stringify({
-          hook_event_name: "PostToolUse",
-          session_id: sessionID,
-          cwd: repoDir,
-          tool_input: { filePath, toolName: input.tool },
-        })
-        await $`echo ${promptHookInput} | ${GIT_AI_BIN} prompt-event opencode --hook-input stdin`.quiet()
-      } catch {
-        // Best-effort
       }
     },
   }

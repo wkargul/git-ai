@@ -1,8 +1,8 @@
-//! Prompt event tracking command.
+//! Prompt event tracking.
 //!
 //! Emits PromptEvent metrics for individual events within a prompt session
-//! (human messages, AI messages, tool calls, etc.). Only works in async_mode
-//! with daemon running.
+//! (human messages, AI messages, tool calls, etc.). Called as a side-effect
+//! of the checkpoint command. Only works in async_mode with daemon running.
 
 use crate::authorship::authorship_log_serialization::generate_short_hash;
 use crate::config;
@@ -193,7 +193,8 @@ fn parse_claude_transcript(transcript_path: &str) -> Result<Vec<TranscriptEvent>
 /// Truncate content for hashing to keep IDs stable even if content grows.
 fn truncate_for_hash(s: &str) -> String {
     if s.len() > 256 {
-        s[..256].to_string()
+        let safe_end = s.floor_char_boundary(256);
+        s[..safe_end].to_string()
     } else {
         s.to_string()
     }
@@ -336,10 +337,16 @@ fn emit_single_event_from_hook(
         _ => format!("hook:{}", hook_event_name),
     };
 
-    let event_id = compute_event_id(prompt_id, kind, &content_hash_input, 0);
-
     // Try to get parent from state
     let state = PromptEventState::load(session_id);
+
+    // Use current event count as index so identical tool calls get unique IDs
+    let event_id = compute_event_id(
+        prompt_id,
+        kind,
+        &content_hash_input,
+        state.emitted_event_ids.len(),
+    );
     let (parent_id, parent_estimated) = if let Some(last) = state.emitted_event_ids.last() {
         (Some(last.clone()), true) // Estimated since transcript failed
     } else {
@@ -430,10 +437,16 @@ fn process_generic_prompt_events(agent: &str, hook_input: &str) -> Result<(), Gi
         hook_event_name, tool_name, hook_data["tool_input"]
     );
 
-    let event_id = compute_event_id(&prompt_id, kind, &content_hash_input, 0);
-
     // Get parent from state (always estimated since we have no transcript)
     let state = PromptEventState::load(session_id);
+
+    // Use current event count as index so identical tool calls get unique IDs
+    let event_id = compute_event_id(
+        &prompt_id,
+        kind,
+        &content_hash_input,
+        state.emitted_event_ids.len(),
+    );
     let (parent_id, parent_estimated) = if let Some(last) = state.emitted_event_ids.last() {
         (Some(last.clone()), true)
     } else {
