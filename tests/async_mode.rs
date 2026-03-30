@@ -73,7 +73,7 @@ fn configure_test_daemon_env(command: &mut Command, repo: &TestRepo) {
     command.env("GIT_AI_DAEMON_TRACE_SOCKET", daemon_trace_socket_path(repo));
 }
 
-fn write_async_mode_config(repo: &TestRepo) {
+fn write_async_mode_config(repo: &mut TestRepo) {
     let config_dir = repo.test_home_path().join(".git-ai");
     fs::create_dir_all(&config_dir).expect("failed to create async mode config dir");
     let config_path = config_dir.join("config.json");
@@ -91,6 +91,15 @@ fn write_async_mode_config(repo: &TestRepo) {
         serde_json::to_vec_pretty(&config).expect("failed to serialize async mode config"),
     )
     .expect("failed to write async mode config");
+
+    // Also patch the test config to override the default test mode config.
+    // The default applies async_mode=false for Wrapper mode, but async_mode
+    // tests explicitly need async_mode=true.
+    repo.patch_git_ai_config(|patch| {
+        patch.feature_flags = Some(serde_json::json!({
+            "async_mode": true
+        }));
+    });
 }
 
 fn git_ai_with_async_daemon_env(repo: &TestRepo, args: &[&str]) -> Result<String, String> {
@@ -244,7 +253,12 @@ fn async_mode_wrapper_commit_passthrough_skips_git_ai_side_effects() {
 
 #[test]
 fn install_hooks_async_mode_sets_daemon_trace2_global_config() {
-    let repo = TestRepo::new_with_mode(GitTestMode::Wrapper);
+    let mut repo = TestRepo::new_with_mode(GitTestMode::Wrapper);
+    repo.patch_git_ai_config(|patch| {
+        patch.feature_flags = Some(serde_json::json!({
+            "async_mode": true
+        }));
+    });
 
     let output = git_ai_with_async_daemon_env(&repo, &["install-hooks", "--dry-run=false"])
         .expect("install-hooks should succeed in async mode");
@@ -286,7 +300,12 @@ fn install_hooks_async_mode_dry_run_does_not_write_trace2_global_config() {
 
 #[test]
 fn install_hooks_async_mode_trace2_target_routes_real_git_trace_to_daemon() {
-    let repo = TestRepo::new_with_mode(GitTestMode::Wrapper);
+    let mut repo = TestRepo::new_with_mode(GitTestMode::Wrapper);
+    repo.patch_git_ai_config(|patch| {
+        patch.feature_flags = Some(serde_json::json!({
+            "async_mode": true
+        }));
+    });
 
     git_ai_with_async_daemon_env(&repo, &["install-hooks", "--dry-run=false"])
         .expect("install-hooks should succeed in async mode");
@@ -320,8 +339,8 @@ fn install_hooks_async_mode_trace2_target_routes_real_git_trace_to_daemon() {
 
 #[test]
 fn async_mode_checkpoint_starts_daemon_when_down() {
-    let repo = TestRepo::new_with_mode(GitTestMode::Wrapper);
-    write_async_mode_config(&repo);
+    let mut repo = TestRepo::new_with_mode(GitTestMode::Wrapper);
+    write_async_mode_config(&mut repo);
 
     let control = daemon_control_socket_path(&repo);
     let trace = daemon_trace_socket_path(&repo);
@@ -685,7 +704,13 @@ fn async_mode_post_commit_non_interactive_suppresses_stats() {
 fn async_mode_post_commit_still_processing_when_no_daemon() {
     // Use plain Wrapper mode (no daemon running) with async_mode forced via env.
     // The wrapper will poll but never find a note, and should print a message.
-    let repo = TestRepo::new_with_mode(GitTestMode::Wrapper);
+    let mut repo = TestRepo::new_with_mode(GitTestMode::Wrapper);
+    // Must patch config to enable async_mode (env var alone won't work due to test patch precedence)
+    repo.patch_git_ai_config(|patch| {
+        patch.feature_flags = Some(serde_json::json!({
+            "async_mode": true
+        }));
+    });
 
     fs::write(repo.path().join("nodaemon.txt"), "hello\n").expect("write");
     repo.git(&["add", "nodaemon.txt"]).expect("add");
