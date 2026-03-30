@@ -12,6 +12,10 @@ use repos::test_file::ExpectedLineExt;
 use repos::test_repo::{GitTestMode, TestRepo};
 
 fn setup_initial_commit(repo: &TestRepo) {
+    // These tests use low-level git plumbing and need synchronous mode
+    unsafe {
+        std::env::set_var("GIT_AI_ASYNC_MODE", "false");
+    }
     let mut readme = repo.filename("README.md");
     readme.set_contents(lines!["# Test Repo"]);
     repo.stage_all_and_commit("initial commit")
