@@ -868,10 +868,28 @@ impl TestRepo {
         self.patch_git_ai_config(|patch| {
             patch.exclude_prompts_in_repositories = Some(vec![]); // No exclusions = share everywhere
             patch.prompt_storage = Some("notes".to_string()); // Use notes mode for tests
-            if git_mode == GitTestMode::WrapperDaemon {
-                patch.feature_flags = Some(serde_json::json!({
-                    "async_mode": true
-                }));
+
+            // Configure async_mode based on test mode.
+            // With async_mode=true as the new default, we need to explicitly control it
+            // per test mode to match the expected behavior for each mode.
+            match git_mode {
+                GitTestMode::WrapperDaemon => {
+                    // WrapperDaemon mode: use async mode (wrapper + daemon together)
+                    patch.feature_flags = Some(serde_json::json!({
+                        "async_mode": true
+                    }));
+                }
+                GitTestMode::Daemon => {
+                    // Pure daemon mode: async is implicit (daemon handles everything)
+                    // Let the default (true) apply
+                }
+                _ => {
+                    // Wrapper, Hooks, Both modes: disable async mode
+                    // These modes use synchronous wrapper or hooks, not async/daemon
+                    patch.feature_flags = Some(serde_json::json!({
+                        "async_mode": false
+                    }));
+                }
             }
         });
     }
