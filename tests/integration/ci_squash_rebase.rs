@@ -561,7 +561,7 @@ fn test_ci_squash_merge_preserves_prompts() {
     );
 
     // Verify the prompts from the feature commit are present in the merge commit
-    for (prompt_id, _) in &feature_log.metadata.prompts {
+    for prompt_id in feature_log.metadata.prompts.keys() {
         assert!(
             merge_log.metadata.prompts.contains_key(prompt_id),
             "Bug #870: Prompt {} from feature commit should be in merge commit",
@@ -648,7 +648,7 @@ fn test_ci_squash_merge_prompts_from_source_commits() {
     );
 
     // Verify all prompts from the feature commit are present in the merge commit
-    for (prompt_id, _) in &expected_prompts {
+    for prompt_id in expected_prompts.keys() {
         assert!(
             merge_log.metadata.prompts.contains_key(prompt_id),
             "Bug #870 fixed: Prompt {} from feature commit should be in merge commit",
