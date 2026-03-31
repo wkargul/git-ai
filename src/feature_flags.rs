@@ -55,10 +55,29 @@ define_feature_flags!(
     rewrite_stash: rewrite_stash, debug = true, release = false,
     inter_commit_move: checkpoint_inter_commit_move, debug = false, release = false,
     auth_keyring: auth_keyring, debug = false, release = false,
-    async_mode: async_mode, debug = false, release = false,
+    async_mode: async_mode, debug = true, release = true,
     git_hooks_enabled: git_hooks_enabled, debug = false, release = false,
     git_hooks_externally_managed: git_hooks_externally_managed, debug = false, release = false,
 );
+
+/// Returns true when running under a non-daemon test mode
+/// (i.e. GIT_AI_TEST_GIT_MODE is set to "wrapper", "hooks", "both", or any value
+/// that does NOT imply daemon usage).  In this case async_mode should be off by
+/// default so that pure-wrapper tests do not accidentally try to reach a daemon.
+///
+/// File config and the GIT_AI_ASYNC_MODE env var can still override this baseline.
+fn is_non_daemon_test_mode() -> bool {
+    if let Ok(mode) = std::env::var("GIT_AI_TEST_GIT_MODE") {
+        // Daemon modes: daemon, trace-daemon, pure-daemon, wrapper-daemon
+        // Everything else (wrapper, hooks, both, unknown) → non-daemon
+        !matches!(
+            mode.to_lowercase().as_str(),
+            "daemon" | "trace-daemon" | "pure-daemon" | "wrapper-daemon"
+        )
+    } else {
+        false // env var not set → production binary, no override
+    }
+}
 
 impl FeatureFlags {
     /// Build FeatureFlags from deserializable config
@@ -89,13 +108,22 @@ impl FeatureFlags {
     }
 
     /// Build FeatureFlags from both file and environment variables
-    /// Precedence: Environment > File > Default
+    /// Precedence: Environment > File > Test-mode baseline > Default
     /// - Starts with defaults
+    /// - In non-daemon test mode (GIT_AI_TEST_GIT_MODE=wrapper|hooks|both),
+    ///   async_mode is forced off so wrapper tests don't accidentally reach a daemon
     /// - Applies file config overrides if present
     /// - Applies environment variable overrides if present (highest priority)
     pub(crate) fn from_env_and_file(file_flags: Option<DeserializableFeatureFlags>) -> Self {
         // Start with defaults
         let mut result = FeatureFlags::default();
+
+        // In non-daemon test modes disable async_mode at the baseline level so
+        // that plain wrapper tests don't try to delegate to a daemon that isn't
+        // running.  File config and GIT_AI_ASYNC_MODE env var can still override.
+        if is_non_daemon_test_mode() {
+            result.async_mode = false;
+        }
 
         // Apply file config overrides
         if let Some(file) = file_flags {
@@ -124,7 +152,7 @@ mod tests {
             assert!(flags.rewrite_stash);
             assert!(!flags.inter_commit_move);
             assert!(!flags.auth_keyring);
-            assert!(!flags.async_mode);
+            assert!(flags.async_mode); // async_mode defaults to true in all builds
             assert!(!flags.git_hooks_enabled);
             assert!(!flags.git_hooks_externally_managed);
         }
@@ -133,7 +161,7 @@ mod tests {
             assert!(!flags.rewrite_stash);
             assert!(!flags.inter_commit_move);
             assert!(!flags.auth_keyring);
-            assert!(!flags.async_mode);
+            assert!(flags.async_mode); // async_mode defaults to true in all builds
             assert!(!flags.git_hooks_enabled);
             assert!(!flags.git_hooks_externally_managed);
         }
@@ -198,12 +226,14 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn test_from_env_and_file_defaults_only() {
-        // No file flags, env should be empty
+        // No file flags, env should be empty.
+        // Remove GIT_AI_TEST_GIT_MODE so we get the raw compile-time defaults.
         unsafe {
             std::env::remove_var("GIT_AI_REWRITE_STASH");
             std::env::remove_var("GIT_AI_CHECKPOINT_INTER_COMMIT_MOVE");
             std::env::remove_var("GIT_AI_AUTH_KEYRING");
             std::env::remove_var("GIT_AI_ASYNC_MODE");
+            std::env::remove_var("GIT_AI_TEST_GIT_MODE");
         }
 
         let flags = FeatureFlags::from_env_and_file(None);
@@ -211,6 +241,70 @@ mod tests {
         assert_eq!(flags.rewrite_stash, defaults.rewrite_stash);
         assert_eq!(flags.inter_commit_move, defaults.inter_commit_move);
         assert_eq!(flags.auth_keyring, defaults.auth_keyring);
+        // async_mode defaults to true when no test mode is active
+        assert!(flags.async_mode);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_from_env_and_file_non_daemon_test_mode_disables_async_mode() {
+        // When GIT_AI_TEST_GIT_MODE is a non-daemon mode (wrapper, hooks, both),
+        // async_mode should be forced off at the baseline level.
+        unsafe {
+            std::env::remove_var("GIT_AI_ASYNC_MODE");
+            std::env::set_var("GIT_AI_TEST_GIT_MODE", "wrapper");
+        }
+        let flags = FeatureFlags::from_env_and_file(None);
+        assert!(!flags.async_mode, "async_mode should be false in wrapper test mode");
+
+        // Explicit file override can re-enable it
+        let file_flags = DeserializableFeatureFlags {
+            async_mode: Some(true),
+            ..Default::default()
+        };
+        let flags_with_file = FeatureFlags::from_env_and_file(Some(file_flags));
+        assert!(
+            flags_with_file.async_mode,
+            "file config should be able to override the test-mode baseline"
+        );
+
+        // Explicit env var override can also re-enable it
+        unsafe {
+            std::env::set_var("GIT_AI_ASYNC_MODE", "true");
+        }
+        let flags_with_env = FeatureFlags::from_env_and_file(None);
+        assert!(
+            flags_with_env.async_mode,
+            "GIT_AI_ASYNC_MODE env var should override the test-mode baseline"
+        );
+
+        unsafe {
+            std::env::remove_var("GIT_AI_ASYNC_MODE");
+            std::env::remove_var("GIT_AI_TEST_GIT_MODE");
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_from_env_and_file_daemon_test_mode_keeps_async_mode_default() {
+        // Daemon modes (daemon, wrapper-daemon) should NOT override async_mode.
+        unsafe {
+            std::env::remove_var("GIT_AI_ASYNC_MODE");
+        }
+        for daemon_mode in &["daemon", "trace-daemon", "pure-daemon", "wrapper-daemon"] {
+            unsafe {
+                std::env::set_var("GIT_AI_TEST_GIT_MODE", daemon_mode);
+            }
+            let flags = FeatureFlags::from_env_and_file(None);
+            assert!(
+                flags.async_mode,
+                "async_mode should remain true in daemon test mode '{}'",
+                daemon_mode
+            );
+        }
+        unsafe {
+            std::env::remove_var("GIT_AI_TEST_GIT_MODE");
+        }
     }
 
     #[test]
@@ -221,6 +315,7 @@ mod tests {
             std::env::remove_var("GIT_AI_CHECKPOINT_INTER_COMMIT_MOVE");
             std::env::remove_var("GIT_AI_AUTH_KEYRING");
             std::env::remove_var("GIT_AI_ASYNC_MODE");
+            std::env::remove_var("GIT_AI_TEST_GIT_MODE");
         }
 
         let file_flags = DeserializableFeatureFlags {

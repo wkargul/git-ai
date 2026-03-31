@@ -125,10 +125,20 @@ fn graphite_style_restack_child_branch(
     new_head
 }
 
-fn should_skip_for_hooks_mode() -> bool {
+fn should_skip_non_wrapper_mode() -> bool {
     let mode = std::env::var("GIT_AI_TEST_GIT_MODE").unwrap_or_else(|_| "wrapper".to_string());
-    if matches!(GitTestMode::from_mode_name(&mode), GitTestMode::Hooks) {
-        eprintln!("SKIP: commit-tree/update-ref regression only runs in wrapper mode");
+    // These tests exercise wrapper-side plumbing interception (commit-tree / update-ref).
+    // They require the git-ai binary to act as a git wrapper.  Pure-daemon mode routes
+    // git commands directly to git without the wrapper, and hooks-only mode likewise
+    // doesn't install the wrapper binary.  Skip in both cases.
+    if matches!(
+        GitTestMode::from_mode_name(&mode),
+        GitTestMode::Hooks | GitTestMode::Daemon
+    ) {
+        eprintln!(
+            "SKIP: commit-tree/update-ref regression only runs in wrapper mode (current: {})",
+            mode
+        );
         return true;
     }
     false
@@ -136,7 +146,7 @@ fn should_skip_for_hooks_mode() -> bool {
 
 #[test]
 fn test_commit_tree_update_ref_preserves_authorship_notes_on_reparent() {
-    if should_skip_for_hooks_mode() {
+    if should_skip_non_wrapper_mode() {
         return;
     }
 
@@ -189,7 +199,7 @@ fn test_commit_tree_update_ref_preserves_authorship_notes_on_reparent() {
 
 #[test]
 fn test_commit_tree_update_ref_moves_working_log_to_rewritten_head() {
-    if should_skip_for_hooks_mode() {
+    if should_skip_non_wrapper_mode() {
         return;
     }
 
@@ -261,7 +271,7 @@ fn test_commit_tree_update_ref_moves_working_log_to_rewritten_head() {
 
 #[test]
 fn test_reset_keep_rewrite_preserves_authorship_notes_on_current_branch() {
-    if should_skip_for_hooks_mode() {
+    if should_skip_non_wrapper_mode() {
         return;
     }
 
@@ -314,7 +324,7 @@ fn test_reset_keep_rewrite_preserves_authorship_notes_on_current_branch() {
 
 #[test]
 fn test_update_ref_restack_after_parent_amend_preserves_child_attribution() {
-    if should_skip_for_hooks_mode() {
+    if should_skip_non_wrapper_mode() {
         return;
     }
 
@@ -387,7 +397,7 @@ fn test_update_ref_restack_after_parent_amend_preserves_child_attribution() {
 /// git-ai must detect the N-commit rewrite and remap all N authorship notes.
 #[test]
 fn test_graphite_style_multi_commit_single_update_ref() {
-    if should_skip_for_hooks_mode() {
+    if should_skip_non_wrapper_mode() {
         return;
     }
 
