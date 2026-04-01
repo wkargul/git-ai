@@ -18,6 +18,7 @@ use tokio::time::{Duration, interval};
 
 use sentry::protocol::{Event as SentryEvent, Level as SentryLevel};
 use sentry::types::Dsn;
+use std::time::SystemTime;
 
 const FLUSH_INTERVAL: Duration = Duration::from_secs(3);
 
@@ -31,14 +32,12 @@ struct TelemetryBuffer {
 }
 
 struct ErrorEvent {
-    #[allow(dead_code)]
     timestamp: String,
     message: String,
     context: Option<Value>,
 }
 
 struct PerformanceEvent {
-    #[allow(dead_code)]
     timestamp: String,
     operation: String,
     duration_ms: u128,
@@ -240,6 +239,10 @@ async fn telemetry_flush_loop(buffer: Arc<Mutex<TelemetryBuffer>>) {
     // The first tick completes immediately; skip it.
     ticker.tick().await;
 
+    // Build long-lived Sentry clients once, reused across all flush cycles.
+    // This avoids repeatedly creating/tearing down transport worker threads.
+    let sentry_clients = Arc::new(SentryClients::new(Config::get()));
+
     loop {
         ticker.tick().await;
 
@@ -251,9 +254,10 @@ async fn telemetry_flush_loop(buffer: Arc<Mutex<TelemetryBuffer>>) {
             buf.take()
         };
 
+        let clients = sentry_clients.clone();
         // Flush in a blocking task since the underlying HTTP clients are synchronous.
         tokio::task::spawn_blocking(move || {
-            flush_telemetry_batch(snapshot);
+            flush_telemetry_batch(snapshot, &clients);
         })
         .await
         .unwrap_or_else(|e| {
@@ -262,7 +266,7 @@ async fn telemetry_flush_loop(buffer: Arc<Mutex<TelemetryBuffer>>) {
     }
 }
 
-fn flush_telemetry_batch(batch: TelemetryBuffer) {
+fn flush_telemetry_batch(batch: TelemetryBuffer, sentry_clients: &SentryClients) {
     let config = Config::get();
     let distinct_id = get_or_create_distinct_id();
 
@@ -279,6 +283,7 @@ fn flush_telemetry_batch(batch: TelemetryBuffer) {
         flush_sentry_and_posthog(
             config,
             &distinct_id,
+            sentry_clients,
             &batch.errors,
             &batch.performances,
             &batch.messages,
@@ -405,25 +410,59 @@ fn parse_sentry_level(level: &str) -> SentryLevel {
     }
 }
 
-/// Send a Sentry event to a client via a temporary Hub.
+/// Parse an RFC 3339 timestamp string into a `SystemTime`.
+/// Falls back to `SystemTime::now()` if parsing fails.
+fn parse_timestamp(ts: &str) -> SystemTime {
+    chrono::DateTime::parse_from_rfc3339(ts)
+        .map(|dt| SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(dt.timestamp() as u64))
+        .unwrap_or_else(|_| SystemTime::now())
+}
+
+/// Send a Sentry event to a client via a scoped Hub.
 ///
-/// Creates a one-off Hub bound to the client so events are routed to the
+/// Creates a Hub bound to the client so events are routed to the
 /// correct DSN without touching the global/thread-local Hub.
 fn send_event_to_client(client: &Arc<sentry::Client>, event: SentryEvent<'static>) {
     let hub = sentry::Hub::new(Some(client.clone()), Arc::new(sentry::Scope::default()));
     hub.capture_event(event);
 }
 
+/// Long-lived Sentry clients reused across flush cycles.
+///
+/// Constructed once per DSN configuration and stored alongside the flush loop.
+/// This avoids the overhead of creating/tearing down transport worker threads
+/// every flush interval.
+struct SentryClients {
+    oss: Option<Arc<sentry::Client>>,
+    enterprise: Option<Arc<sentry::Client>>,
+}
+
+impl SentryClients {
+    fn new(config: &Config) -> Self {
+        let oss = resolve_oss_dsn(config).and_then(|dsn| build_sentry_client(&dsn));
+        let enterprise = resolve_enterprise_dsn(config).and_then(|dsn| build_sentry_client(&dsn));
+        SentryClients { oss, enterprise }
+    }
+
+    /// Flush both clients to ensure all enqueued events are delivered.
+    fn flush(&self, timeout: std::time::Duration) {
+        if let Some(client) = &self.oss {
+            client.flush(Some(timeout));
+        }
+        if let Some(client) = &self.enterprise {
+            client.flush(Some(timeout));
+        }
+    }
+}
+
 fn flush_sentry_and_posthog(
     config: &Config,
     distinct_id: &str,
+    sentry_clients: &SentryClients,
     errors: &[ErrorEvent],
     performances: &[PerformanceEvent],
     messages: &[MessageEvent],
 ) {
-    let enterprise_dsn = resolve_enterprise_dsn(config);
-    let oss_dsn = resolve_oss_dsn(config);
-
     // Check for PostHog configuration
     let posthog_api_key = if config.is_telemetry_oss_disabled() {
         None
@@ -440,29 +479,27 @@ fn flush_sentry_and_posthog(
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "https://us.i.posthog.com".to_string());
 
-    // Build standard sentry SDK clients
-    let oss_client = oss_dsn.and_then(|dsn| build_sentry_client(&dsn));
-    let enterprise_client = enterprise_dsn.and_then(|dsn| build_sentry_client(&dsn));
-
     let tags = base_sentry_tags(distinct_id);
 
     // Send errors
     for error in errors {
         let extra = context_to_extra(&error.context);
+        let timestamp = parse_timestamp(&error.timestamp);
 
         let event = SentryEvent {
             message: Some(error.message.clone()),
             level: SentryLevel::Error,
+            timestamp,
             platform: "other".into(),
             tags: tags.clone(),
             extra,
             ..Default::default()
         };
 
-        if let Some(client) = &oss_client {
+        if let Some(client) = &sentry_clients.oss {
             send_event_to_client(client, event.clone());
         }
-        if let Some(client) = &enterprise_client {
+        if let Some(client) = &sentry_clients.enterprise {
             send_event_to_client(client, event);
         }
     }
@@ -472,6 +509,7 @@ fn flush_sentry_and_posthog(
         let mut extra = context_to_extra(&perf.context);
         extra.insert("operation".to_string(), json!(perf.operation));
         extra.insert("duration_ms".to_string(), json!(perf.duration_ms));
+        let timestamp = parse_timestamp(&perf.timestamp);
 
         let mut perf_tags = tags.clone();
         if let Some(t) = &perf.tags {
@@ -486,16 +524,17 @@ fn flush_sentry_and_posthog(
                 perf.operation, perf.duration_ms
             )),
             level: SentryLevel::Info,
+            timestamp,
             platform: "other".into(),
             tags: perf_tags,
             extra,
             ..Default::default()
         };
 
-        if let Some(client) = &oss_client {
+        if let Some(client) = &sentry_clients.oss {
             send_event_to_client(client, event.clone());
         }
-        if let Some(client) = &enterprise_client {
+        if let Some(client) = &sentry_clients.enterprise {
             send_event_to_client(client, event);
         }
     }
@@ -503,20 +542,22 @@ fn flush_sentry_and_posthog(
     // Send messages (to Sentry + PostHog)
     for msg in messages {
         let extra = context_to_extra(&msg.context);
+        let timestamp = parse_timestamp(&msg.timestamp);
 
         let event = SentryEvent {
             message: Some(msg.message.clone()),
             level: parse_sentry_level(&msg.level),
+            timestamp,
             platform: "other".into(),
             tags: tags.clone(),
             extra,
             ..Default::default()
         };
 
-        if let Some(client) = &oss_client {
+        if let Some(client) = &sentry_clients.oss {
             send_event_to_client(client, event.clone());
         }
-        if let Some(client) = &enterprise_client {
+        if let Some(client) = &sentry_clients.enterprise {
             send_event_to_client(client, event);
         }
 
@@ -551,6 +592,10 @@ fn flush_sentry_and_posthog(
                 .send();
         }
     }
+
+    // Flush the sentry transport to ensure all enqueued events are delivered
+    // before this batch is considered complete.
+    sentry_clients.flush(std::time::Duration::from_secs(5));
 }
 
 fn flush_cas(records: Vec<CasSyncPayload>) {
