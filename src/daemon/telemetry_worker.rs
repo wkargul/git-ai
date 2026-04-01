@@ -414,8 +414,16 @@ fn parse_sentry_level(level: &str) -> SentryLevel {
 /// Falls back to `SystemTime::now()` if parsing fails.
 fn parse_timestamp(ts: &str) -> SystemTime {
     chrono::DateTime::parse_from_rfc3339(ts)
-        .map(|dt| SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(dt.timestamp() as u64))
-        .unwrap_or_else(|_| SystemTime::now())
+        .ok()
+        .and_then(|dt| {
+            let secs = dt.timestamp();
+            if secs >= 0 {
+                Some(SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs as u64))
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(SystemTime::now)
 }
 
 /// Send a Sentry event to a client via a scoped Hub.
