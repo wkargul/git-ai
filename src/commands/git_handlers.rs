@@ -18,6 +18,7 @@ use crate::config;
 use crate::git::cli_parser::{ParsedGitInvocation, parse_git_cli_args};
 use crate::git::find_repository;
 use crate::git::repository::{Repository, disable_internal_git_hooks};
+use crate::git::sync_authorship;
 use crate::observability;
 use std::collections::HashSet;
 
@@ -136,12 +137,25 @@ pub fn handle_git(args: &[String]) {
         // so the daemon doesn't wait for wrapper state that never arrives or
         // is misleading; trace2 events still flow normally (trace2 suppression
         // requires *both* no invocation_id and a read-only command).
-        let is_repo_creating = parsed
-            .command
-            .as_deref()
-            .is_some_and(|cmd| matches!(cmd, "clone" | "init"));
+        //
+        // For clone specifically, we still need to fetch authorship notes after
+        // the clone completes. The daemon will also handle this via side effects,
+        // but we run the post-clone hook as a fallback to ensure notes are fetched
+        // even if the daemon side effect fails or trace2 isn't configured.
+        let is_clone = parsed.command.as_deref() == Some("clone");
+        let is_init = parsed.command.as_deref() == Some("init");
 
-        if is_repo_creating {
+        if is_clone {
+            let exit_status = proxy_to_git(args, false, None, None);
+            if exit_status_was_interrupted(&exit_status) {
+                exit_with_status(exit_status);
+            }
+            // Run post-clone hook to fetch authorship notes
+            clone_hooks::post_clone_hook(&parsed, exit_status);
+            exit_with_status(exit_status);
+        }
+
+        if is_init {
             let exit_status = proxy_to_git(args, false, None, None);
             exit_with_status(exit_status);
         }
@@ -180,6 +194,31 @@ pub fn handle_git(args: &[String]) {
             && let Some(repo) = repository.as_ref()
         {
             maybe_show_async_post_commit_stats(&parsed, repo);
+        }
+
+        // For pull/push commands, run synchronous note sync as a fallback.
+        // The daemon handles these via side effects, but we provide redundancy
+        // to ensure notes are synced even if daemon side effects fail or trace2
+        // isn't properly configured. Note: plain `git fetch` should NOT fetch
+        // authorship notes (only `git pull` should).
+        if exit_status.success() && let Some(repo) = repository {
+            match parsed.command.as_deref() {
+                Some("pull") => {
+                    if let Ok(remote) = sync_authorship::fetch_remote_from_args(&repo, &parsed) {
+                        // Fetch notes synchronously as fallback
+                        let _ = sync_authorship::fetch_authorship_notes(&repo, &remote);
+                    }
+                }
+                Some("push") => {
+                    if !push_hooks::should_skip_authorship_push(&parsed.command_args) {
+                        if let Some(remote) = push_hooks::resolve_push_remote(&parsed, &repo) {
+                            // Push notes synchronously as fallback
+                            let _ = sync_authorship::push_authorship_notes(&repo, &remote);
+                        }
+                    }
+                }
+                _ => {}
+            }
         }
 
         exit_with_status(exit_status);

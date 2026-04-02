@@ -79,13 +79,13 @@ pub fn push_post_command_hook(
     }
 }
 
-fn should_skip_authorship_push(command_args: &[String]) -> bool {
+pub fn should_skip_authorship_push(command_args: &[String]) -> bool {
     is_dry_run(command_args)
         || command_args.iter().any(|a| a == "-d" || a == "--delete")
         || command_args.iter().any(|a| a == "--mirror")
 }
 
-fn resolve_push_remote(
+pub fn resolve_push_remote(
     parsed_args: &ParsedGitInvocation,
     repository: &Repository,
 ) -> Option<String> {
