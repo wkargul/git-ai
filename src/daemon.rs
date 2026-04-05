@@ -1240,7 +1240,16 @@ fn tracked_reflog_refs_for_command(
     }
     if matches!(
         command,
-        Some("reset" | "merge" | "pull" | "rebase" | "cherry-pick" | "revert" | "checkout" | "switch")
+        Some(
+            "reset"
+                | "merge"
+                | "pull"
+                | "rebase"
+                | "cherry-pick"
+                | "revert"
+                | "checkout"
+                | "switch"
+        )
     ) {
         refs.push("ORIG_HEAD".to_string());
     }
@@ -1492,11 +1501,9 @@ fn apply_revert_attribution_side_effect(
                 reverted_ref, err
             ))
         })?;
-        let oid = obj
-            .peel_to_commit()
+        obj.peel_to_commit()
             .map(|c| c.id())
-            .unwrap_or_else(|_| obj.id());
-        oid
+            .unwrap_or_else(|_| obj.id())
     };
 
     if reverted_commit.is_empty() || is_zero_oid(&reverted_commit) {
@@ -1549,14 +1556,12 @@ fn apply_revert_attribution_side_effect(
     };
 
     let source_sha = match parent_sha {
-        Some(ref parent) => {
-            match get_reference_as_authorship_log_v3(&repo, parent) {
-                Ok(log) if log.metadata.prompts.values().any(|p| p.accepted_lines > 0) => {
-                    Some(parent.clone())
-                }
-                _ => None,
+        Some(ref parent) => match get_reference_as_authorship_log_v3(&repo, parent) {
+            Ok(log) if log.metadata.prompts.values().any(|p| p.accepted_lines > 0) => {
+                Some(parent.clone())
             }
-        }
+            _ => None,
+        },
         None => None,
     };
 
@@ -1574,13 +1579,13 @@ fn apply_revert_attribution_side_effect(
     match get_reference_as_authorship_log_v3(&repo, &source_sha) {
         Ok(mut log) => {
             log.metadata.base_commit_sha = new_head.to_string();
-            if let Ok(serialized) = log.serialize_to_string() {
-                if let Err(e) = notes_add(&repo, new_head, &serialized) {
-                    debug_log(&format!(
-                        "daemon revert: failed to add note to {}: {}",
-                        new_head, e
-                    ));
-                }
+            if let Ok(serialized) = log.serialize_to_string()
+                && let Err(e) = notes_add(&repo, new_head, &serialized)
+            {
+                debug_log(&format!(
+                    "daemon revert: failed to add note to {}: {}",
+                    new_head, e
+                ));
             }
         }
         Err(e) => {
@@ -7124,11 +7129,9 @@ impl ActorDaemonCoordinator {
                         original_head: _,
                         new_head,
                     } => {
-                        if let Err(e) = apply_revert_attribution_side_effect(
-                            &worktree,
-                            cmd,
-                            new_head,
-                        ) {
+                        if let Err(e) =
+                            apply_revert_attribution_side_effect(&worktree, cmd, new_head)
+                        {
                             debug_log(&format!(
                                 "daemon revert attribution side effect failed for {}: {}",
                                 worktree, e

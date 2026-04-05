@@ -139,7 +139,7 @@ fn find_reverted_commit(
         if arg.starts_with('-') {
             if matches!(
                 arg.as_str(),
-                "-m" | "--mainline" | "-s" | "--strategy" | "-X" | "--strategy-option"
+                "-m" | "--mainline" | "--strategy" | "-X" | "--strategy-option"
             ) {
                 i += 2; // Skip flag and its value
                 continue;
