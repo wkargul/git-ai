@@ -1,20 +1,99 @@
 use crate::authorship::authorship_log_serialization::{AUTHORSHIP_LOG_VERSION, AuthorshipLog};
 use crate::authorship::working_log::Checkpoint;
 use crate::error::GitAiError;
-use crate::git::repository::{Repository, exec_git, exec_git_stdin};
+use crate::git::repository::{Repository, exec_git, exec_git_allow_nonzero, exec_git_stdin};
 use crate::utils::debug_log;
 use serde_json;
 use std::collections::{HashMap, HashSet};
+use std::sync::Mutex;
 
 // Modern refspecs without force to enable proper merging
 pub const AI_AUTHORSHIP_REFNAME: &str = "ai";
 pub const AI_AUTHORSHIP_PUSH_REFSPEC: &str = "refs/notes/ai:refs/notes/ai";
+
+/// Set of repository paths for which `notes.rewriteRef=refs/notes/ai` has
+/// already been confirmed to be present in the local git config during this
+/// process run.  Prevents redundant `git config` subprocess calls on every
+/// note write.
+fn notes_rewrite_ref_configured_repos() -> &'static Mutex<HashSet<String>> {
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// Ensure `notes.rewriteRef=refs/notes/ai` is present in the repository's
+/// local git config.
+///
+/// Git's built-in post-rewrite machinery uses this setting to copy notes from
+/// old commit SHAs to new ones whenever a rebase or amend rewrites history.
+/// Without it, external tools (e.g. Graphite, IDE integrations) that invoke
+/// `git rebase -i` directly — bypassing the git-ai wrapper — will produce
+/// rewritten commits with no `refs/notes/ai` note, even when the original
+/// commits carried attribution data.
+///
+/// The result is cached per repository path so that the check costs at most
+/// one pair of `git config` subprocess calls per repository per process run.
+pub fn ensure_notes_rewrite_ref_configured(repo: &Repository) {
+    let repo_key = repo.path().to_string_lossy().into_owned();
+
+    // Fast path: already confirmed for this repo during this process run.
+    if let Ok(cache) = notes_rewrite_ref_configured_repos().lock()
+        && cache.contains(&repo_key)
+    {
+        return;
+    }
+
+    // Check whether refs/notes/ai is already listed.
+    let mut check_args = repo.global_args_for_exec();
+    check_args.extend(
+        ["config", "--local", "--get-all", "notes.rewriteRef"]
+            .iter()
+            .map(|s| s.to_string()),
+    );
+    let already_configured = exec_git_allow_nonzero(&check_args)
+        .map(|output| {
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .any(|line| line.trim() == "refs/notes/ai")
+        })
+        .unwrap_or(false);
+
+    if !already_configured {
+        let mut set_args = repo.global_args_for_exec();
+        set_args.extend(
+            [
+                "config",
+                "--local",
+                "--add",
+                "notes.rewriteRef",
+                "refs/notes/ai",
+            ]
+            .iter()
+            .map(|s| s.to_string()),
+        );
+        match exec_git(&set_args) {
+            Ok(_) => debug_log(
+                "Configured notes.rewriteRef=refs/notes/ai so external rebases preserve AI notes",
+            ),
+            Err(e) => debug_log(&format!(
+                "Could not set notes.rewriteRef in local git config: {}",
+                e
+            )),
+        }
+    }
+
+    // Mark as confirmed regardless of whether we wrote it (already present counts too).
+    if let Ok(mut cache) = notes_rewrite_ref_configured_repos().lock() {
+        cache.insert(repo_key);
+    }
+}
 
 pub fn notes_add(
     repo: &Repository,
     commit_sha: &str,
     note_content: &str,
 ) -> Result<(), GitAiError> {
+    ensure_notes_rewrite_ref_configured(repo);
     let mut args = repo.global_args_for_exec();
     args.push("notes".to_string());
     args.push("--ref=ai".to_string());
@@ -183,18 +262,7 @@ pub fn notes_add_batch(repo: &Repository, entries: &[(String, String)]) -> Resul
         return Ok(());
     }
 
-    let mut args = repo.global_args_for_exec();
-    args.push("rev-parse".to_string());
-    args.push("--verify".to_string());
-    args.push("refs/notes/ai".to_string());
-    let existing_notes_tip = match exec_git(&args) {
-        Ok(output) => Some(String::from_utf8(output.stdout)?.trim().to_string()),
-        Err(GitAiError::GitCliError {
-            code: Some(128), ..
-        })
-        | Err(GitAiError::GitCliError { code: Some(1), .. }) => None,
-        Err(e) => return Err(e),
-    };
+    ensure_notes_rewrite_ref_configured(repo);
 
     let mut deduped_entries: Vec<(String, String)> = Vec::new();
     let mut seen = HashSet::new();
@@ -210,40 +278,118 @@ pub fn notes_add_batch(repo: &Repository, entries: &[(String, String)]) -> Resul
         .map_err(|e| GitAiError::Generic(format!("System clock before epoch: {}", e)))?
         .as_secs();
 
-    let mut script = Vec::<u8>::new();
-
+    // Build the blob section once (blobs are independent of the notes ref tip).
+    let mut blob_section = Vec::<u8>::new();
     for (idx, (_commit_sha, note_content)) in deduped_entries.iter().enumerate() {
-        script.extend_from_slice(b"blob\n");
-        script.extend_from_slice(format!("mark :{}\n", idx + 1).as_bytes());
-        script.extend_from_slice(format!("data {}\n", note_content.len()).as_bytes());
-        script.extend_from_slice(note_content.as_bytes());
-        script.extend_from_slice(b"\n");
+        blob_section.extend_from_slice(b"blob\n");
+        blob_section.extend_from_slice(format!("mark :{}\n", idx + 1).as_bytes());
+        blob_section.extend_from_slice(format!("data {}\n", note_content.len()).as_bytes());
+        blob_section.extend_from_slice(note_content.as_bytes());
+        blob_section.extend_from_slice(b"\n");
     }
-
-    script.extend_from_slice(b"commit refs/notes/ai\n");
-    script.extend_from_slice(format!("committer git-ai <git-ai@local> {} +0000\n", now).as_bytes());
-    script.extend_from_slice(b"data 0\n");
-    if let Some(existing_tip) = existing_notes_tip {
-        script.extend_from_slice(format!("from {}\n", existing_tip).as_bytes());
-    }
-
-    for (idx, (commit_sha, _note_content)) in deduped_entries.iter().enumerate() {
-        let fanout_path = notes_path_for_object(commit_sha);
-        let flat_path = commit_sha.clone();
-        if flat_path != fanout_path {
-            script.extend_from_slice(format!("D {}\n", flat_path).as_bytes());
-        }
-        script.extend_from_slice(format!("D {}\n", fanout_path).as_bytes());
-        script.extend_from_slice(format!("M 100644 :{} {}\n", idx + 1, fanout_path).as_bytes());
-    }
-    script.extend_from_slice(b"\n");
 
     let mut fast_import_args = repo.global_args_for_exec();
     fast_import_args.push("fast-import".to_string());
     fast_import_args.push("--quiet".to_string());
-    exec_git_stdin(&fast_import_args, &script)?;
-    crate::authorship::git_ai_hooks::post_notes_updated(repo, &deduped_entries);
 
+    // Retry loop: if the notes ref is updated concurrently (e.g. by git's
+    // notes.rewriteRef machinery or another daemon instance) between the time we
+    // read the tip and the time fast-import runs, git fast-import will refuse the
+    // non-fast-forward update.  Re-reading the latest tip and retrying is safe
+    // because our blobs don't change – only the `from` parent changes.
+    const MAX_ATTEMPTS: u8 = 4;
+    let mut last_err = None;
+    for attempt in 0..MAX_ATTEMPTS {
+        let existing_notes_tip = {
+            let mut args = repo.global_args_for_exec();
+            args.push("rev-parse".to_string());
+            args.push("--verify".to_string());
+            args.push("refs/notes/ai".to_string());
+            match exec_git(&args) {
+                Ok(output) => Some(String::from_utf8(output.stdout)?.trim().to_string()),
+                Err(GitAiError::GitCliError {
+                    code: Some(128), ..
+                })
+                | Err(GitAiError::GitCliError { code: Some(1), .. }) => None,
+                Err(e) => return Err(e),
+            }
+        };
+
+        let mut script = blob_section.clone();
+        script.extend_from_slice(b"commit refs/notes/ai\n");
+        script.extend_from_slice(
+            format!("committer git-ai <git-ai@local> {} +0000\n", now).as_bytes(),
+        );
+        script.extend_from_slice(b"data 0\n");
+        if let Some(ref existing_tip) = existing_notes_tip {
+            script.extend_from_slice(format!("from {}\n", existing_tip).as_bytes());
+        }
+
+        for (idx, (commit_sha, _note_content)) in deduped_entries.iter().enumerate() {
+            let fanout_path = notes_path_for_object(commit_sha);
+            let flat_path = commit_sha.clone();
+            if flat_path != fanout_path {
+                script.extend_from_slice(format!("D {}\n", flat_path).as_bytes());
+            }
+            script.extend_from_slice(format!("D {}\n", fanout_path).as_bytes());
+            script.extend_from_slice(format!("M 100644 :{} {}\n", idx + 1, fanout_path).as_bytes());
+        }
+        script.extend_from_slice(b"\n");
+
+        match exec_git_stdin(&fast_import_args, &script) {
+            Ok(_) => {
+                crate::authorship::git_ai_hooks::post_notes_updated(repo, &deduped_entries);
+                return Ok(());
+            }
+            Err(GitAiError::GitCliError {
+                code: Some(1),
+                ref stderr,
+                ..
+            }) if stderr.contains("not updating refs/notes/ai") => {
+                // Concurrent write advanced the notes ref ahead of our `from`
+                // parent.  Re-read the latest tip and retry.
+                debug_log(&format!(
+                    "notes_add_batch: non-fast-forward conflict on attempt {}, retrying",
+                    attempt + 1
+                ));
+                last_err = Some(GitAiError::Generic(format!(
+                    "notes_add_batch: non-fast-forward conflict after {} attempts",
+                    attempt + 1
+                )));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+
+    Err(last_err.unwrap_or_else(|| {
+        GitAiError::Generic("notes_add_batch: failed after all retry attempts".to_string())
+    }))
+}
+
+/// Remove notes for a batch of commits (best-effort; non-fatal on errors).
+///
+/// Called by the wrapper's post-rebase processing to clear any notes that git
+/// automatically copied via `notes.rewriteRef` before git-ai rewrites them with
+/// correct attribution.  External-tool rebases that bypass the wrapper keep the
+/// auto-copied notes, which is the desired behaviour for issue #970.
+pub fn notes_remove_batch(repo: &Repository, commit_shas: &[String]) -> Result<(), GitAiError> {
+    if commit_shas.is_empty() {
+        return Ok(());
+    }
+    let mut args = repo.global_args_for_exec();
+    args.push("notes".to_string());
+    args.push("--ref=ai".to_string());
+    args.push("remove".to_string());
+    args.push("--ignore-missing".to_string());
+    args.extend(commit_shas.iter().cloned());
+    // Non-fatal: if removal fails we still proceed with reprocessing.
+    if let Err(e) = exec_git(&args) {
+        debug_log(&format!(
+            "notes_remove_batch: non-fatal error removing {} notes: {}",
+            commit_shas.len(),
+            e
+        ));
+    }
     Ok(())
 }
 

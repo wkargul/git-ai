@@ -2169,3 +2169,76 @@ fn test_rebase_preserves_authorship_with_multibyte_utf8_in_diff_context() {
         "    assert result".ai()
     ]);
 }
+
+/// Regression test for git-ai/issues/970: when a commit is dropped during
+/// rebase by an external tool that invokes `git rebase` directly (bypassing
+/// the git-ai wrapper), the surviving rewritten commits must still retain
+/// their `refs/notes/ai` notes.
+///
+/// Scenario:
+///   base → A (human-only) → B (AI-attributed)
+///   External tool runs: git rebase --onto base A
+///   =>  base → B'  (A is dropped, B is replayed as B')
+///   B' must preserve B's AI-attribution note.
+///
+/// Root cause (issue #970): `notes.rewriteRef=refs/notes/ai` was not written
+/// to the repository's local git config, so Git's built-in
+/// `notes copy --for-rewrite=rebase` mechanism never ran for the custom AI
+/// notes namespace.  After the fix, git-ai writes this config entry the first
+/// time it adds a note to a repository, so any subsequent external rebase
+/// automatically triggers Git's native per-commit note copy.
+///
+/// A secondary bug also existed in the wrapper path: git-ai's zip-based
+/// commit mapping was incorrect when `original_commits.len() >
+/// new_commits.len()` (drop scenario), stamping the *dropped* commit's note
+/// onto the surviving rewritten commit.  That is fixed by removing the
+/// `force_process_existing_notes` override so git-ai respects notes that Git
+/// already copied correctly.
+#[test]
+fn test_rebase_drop_commit_preserves_surviving_commit_notes() {
+    let repo = TestRepo::new();
+
+    // Create base commit
+    let mut base_file = repo.filename("base.txt");
+    base_file.set_contents(crate::lines!["base content"]);
+    repo.stage_all_and_commit("Base commit").unwrap();
+
+    repo.git(&["checkout", "-b", "feature"]).unwrap();
+
+    // Commit A: human-only (will be dropped by the rebase).
+    let mut file_a = repo.filename("file_a.txt");
+    file_a.set_contents(crate::lines!["human only content"]);
+    repo.stage_all_and_commit("Commit A (to be dropped)")
+        .unwrap();
+
+    // Commit B: has AI attribution (must survive the rebase with its note
+    // intact).  Writing the note via the wrapper causes git-ai to configure
+    // notes.rewriteRef=refs/notes/ai in the local git config so that
+    // subsequent external rebases benefit from Git's native note copy.
+    let mut file_b = repo.filename("file_b.txt");
+    file_b.set_contents(crate::lines!["ai authored line".ai(), "human line"]);
+    repo.stage_all_and_commit("Commit B (AI attributed)")
+        .unwrap();
+
+    // Capture SHAs before the rebase.
+    let commit_a_sha = repo
+        .git(&["rev-parse", "HEAD~1"])
+        .unwrap()
+        .trim()
+        .to_string();
+    let base_sha = repo
+        .git(&["rev-parse", "HEAD~2"])
+        .unwrap()
+        .trim()
+        .to_string();
+
+    // Simulate an external tool (e.g. Graphite) running `git rebase` directly,
+    // bypassing the git-ai wrapper.  `git rebase --onto <base> <A>` replays
+    // every commit after A (exclusive) up to HEAD onto <base>, effectively
+    // dropping A and rewriting B → B'.
+    repo.git_og(&["rebase", "--onto", &base_sha, &commit_a_sha])
+        .expect("git rebase --onto should succeed");
+
+    // B' must still carry AI attribution from the original B commit.
+    file_b.assert_lines_and_blame(crate::lines!["ai authored line".ai(), "human line".human(),]);
+}

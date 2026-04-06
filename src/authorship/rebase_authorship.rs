@@ -19,8 +19,14 @@ struct PromptLineMetrics {
 /// Pre-loaded note data for all commits involved in a rebase.
 /// Eliminates redundant git subprocess calls by reading everything once upfront.
 struct RebaseNoteCache {
-    /// Which new commits already have authorship notes (to skip reprocessing)
-    new_commits_with_notes: HashSet<String>,
+    /// New commits that have a *fresh* (up-to-date) authorship note with `base_commit_sha`
+    /// equal to their own SHA.  These are pre-existing commits from the rebase target branch
+    /// that should NOT be reprocessed.
+    ///
+    /// New commits whose notes were auto-copied by `notes.rewriteRef` will have a *stale*
+    /// `base_commit_sha` (pointing to the original pre-rebase SHA) and will NOT appear here,
+    /// so they fall through to be reprocessed by the wrapper.
+    new_commits_with_fresh_notes: HashSet<String>,
     /// Note blob OIDs for original commits (commit_sha → blob_oid)
     original_note_blob_oids: HashMap<String, String>,
     /// Parsed note contents for original commits (commit_sha → raw_content)
@@ -42,7 +48,7 @@ fn load_rebase_note_cache(
     let all_note_oids = note_blob_oids_for_commits(repo, &all_commits)?;
 
     let mut original_note_blob_oids = HashMap::new();
-    let mut new_commits_with_notes = HashSet::new();
+    let mut new_note_blob_oids: HashMap<String, String> = HashMap::new();
 
     for commit in original_commits {
         if let Some(oid) = all_note_oids.get(commit) {
@@ -50,14 +56,19 @@ fn load_rebase_note_cache(
         }
     }
     for commit in new_commits {
-        if all_note_oids.contains_key(commit) {
-            new_commits_with_notes.insert(commit.clone());
+        if let Some(oid) = all_note_oids.get(commit) {
+            new_note_blob_oids.insert(commit.clone(), oid.clone());
         }
     }
 
-    // Step 2: Read all original note blob contents in one batch call.
+    // Step 2: Read all original AND new-commit note blob contents in one batch call.
+    // New commit notes are read so we can distinguish "fresh" notes (base_commit_sha matches
+    // the new commit's own SHA — a pre-existing target-branch commit that should be skipped)
+    // from "stale" auto-copied notes (base_commit_sha still points to the pre-rebase SHA —
+    // copied by git's notes.rewriteRef machinery and must be reprocessed by git-ai).
     let mut unique_blob_oids: Vec<String> = original_note_blob_oids
         .values()
+        .chain(new_note_blob_oids.values())
         .cloned()
         .collect::<HashSet<_>>()
         .into_iter()
@@ -79,8 +90,31 @@ fn load_rebase_note_cache(
         }
     }
 
+    // Build the set of new commits whose notes are "fresh" (non-stale).
+    //
+    // A note is fresh if and only if it is valid authorship-log JSON **and** its
+    // `base_commit_sha` field equals the new commit's own SHA.
+    //
+    // Two classes of non-fresh notes must NOT be skipped:
+    // • Stale auto-copied notes — `notes.rewriteRef` copies the old commit's blob
+    //   verbatim, so `base_commit_sha` still points to the pre-rebase SHA.
+    // • Garbage concatenated notes — produced when `git rebase --continue` runs
+    //   `git notes copy --for-rewrite=rebase` after an interactive edit+amend.
+    //   At that point `git notes copy` concatenates A's stale blob with the fresh
+    //   note written by the amend step, creating invalid JSON.  A deserialization
+    //   failure here correctly forces the wrapper to reprocess the commit.
+    let mut new_commits_with_fresh_notes: HashSet<String> = HashSet::new();
+    for (commit_sha, blob_oid) in &new_note_blob_oids {
+        if let Some(content) = blob_contents.get(blob_oid)
+            && let Ok(log) = AuthorshipLog::deserialize_from_string(content)
+            && log.metadata.base_commit_sha == *commit_sha
+        {
+            new_commits_with_fresh_notes.insert(commit_sha.clone());
+        }
+    }
+
     Ok(RebaseNoteCache {
-        new_commits_with_notes,
+        new_commits_with_fresh_notes,
         original_note_blob_oids,
         original_note_contents,
         ai_touched_files,
@@ -981,26 +1015,41 @@ pub fn rewrite_authorship_after_rebase_v2(
         phase_start.elapsed().as_millis(),
     ));
     debug_performance_log(&format!(
-        "rebase_v2: loaded note cache ({} original notes, {} new with notes) in {}ms",
+        "rebase_v2: loaded note cache ({} original notes, {} new with fresh notes) in {}ms",
         note_cache.original_note_contents.len(),
-        note_cache.new_commits_with_notes.len(),
+        note_cache.new_commits_with_fresh_notes.len(),
         phase_start.elapsed().as_millis()
     ));
 
-    // Filter out commits that already have authorship logs (these are commits from the target branch).
+    // Filter out commits that already have *fresh* authorship notes.
+    //
+    // A fresh note has `base_commit_sha` equal to the new commit's own SHA, meaning it was
+    // written for that exact commit (e.g. it lives on a target-branch commit that was
+    // included in `new_commits` by `build_rebase_commit_mappings`).  These commits must not
+    // be reprocessed.
+    //
+    // Auto-copied notes produced by git's `notes.rewriteRef` machinery have a *stale*
+    // `base_commit_sha` (still pointing to the pre-rebase original SHA).  They do NOT appear
+    // in `new_commits_with_fresh_notes` and therefore fall through to be reprocessed below,
+    // which is the correct behaviour for managed-wrapper rebases.
+    //
+    // In the drop/squash case (original_commits.len() > new_commits.len()) we always
+    // reprocess all new commits regardless, because the note mapping must be rebuilt.
     let force_process_existing_notes = original_commits.len() > new_commits.len();
     let commits_to_process: Vec<String> = new_commits
         .iter()
         .filter(|commit| {
-            let has_log = !force_process_existing_notes
-                && note_cache.new_commits_with_notes.contains(commit.as_str());
-            if has_log {
+            let has_fresh_log = !force_process_existing_notes
+                && note_cache
+                    .new_commits_with_fresh_notes
+                    .contains(commit.as_str());
+            if has_fresh_log {
                 debug_log(&format!(
-                    "Skipping commit {} (already has authorship log)",
+                    "Skipping commit {} (already has fresh authorship log)",
                     commit
                 ));
             }
-            !has_log
+            !has_fresh_log
         })
         .cloned()
         .collect();
