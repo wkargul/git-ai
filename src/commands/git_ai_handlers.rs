@@ -24,11 +24,13 @@ use crate::git::repository::{CommitRange, Repository, group_files_by_repository}
 use crate::git::sync_authorship::{NotesExistence, fetch_authorship_notes, push_authorship_notes};
 use crate::observability::wrapper_performance_targets::log_performance_for_checkpoint;
 use crate::observability::{self, log_message};
+use crate::utils::debug_log;
 use crate::utils::is_interactive_terminal;
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::io::IsTerminal;
 use std::io::Read;
+use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub fn handle_git_ai(args: &[String]) {
@@ -415,10 +417,15 @@ fn handle_checkpoint(args: &[String]) {
                 match CodexPreset.run(AgentCheckpointFlags {
                     hook_input: hook_input.clone(),
                 }) {
-                    Ok(agent_run) => {
+                    Ok(mut agent_run) => {
                         if agent_run.repo_working_dir.is_some() {
                             repository_working_dir = agent_run.repo_working_dir.clone().unwrap();
                         }
+                        // Codex `notify` is non-blocking: the checkpoint may fire
+                        // before or after Codex writes the file.  Scan dirty files
+                        // in the working directory and check their mtime to decide
+                        // whether the write already happened.
+                        codex_apply_mtime_race_heuristic(&mut agent_run, &repository_working_dir);
                         agent_run_result = Some(agent_run);
                     }
                     Err(e) => {
@@ -1827,6 +1834,346 @@ fn get_all_files_for_mock_ai(working_dir: &str) -> Vec<String> {
     match repo.get_staged_and_unstaged_filenames() {
         Ok(filenames) => filenames.into_iter().collect(),
         Err(_) => Vec::new(),
+    }
+}
+
+/// Maximum age of a file's mtime (in seconds) for the Codex race-condition
+/// heuristic.  If any dirty file in the working tree was modified within this
+/// window we assume Codex already wrote it before the checkpoint fired.
+const CODEX_MTIME_RACE_WINDOW_SECS: u64 = 5;
+
+/// Scan dirty files in the working directory and, if any were modified within
+/// [`CODEX_MTIME_RACE_WINDOW_SECS`], populate `edited_filepaths` on the
+/// `AgentRunResult` so the downstream checkpoint treats the write as an
+/// AI-authored edit.  This is intentionally scoped to Codex only because its
+/// `notify` hook is non-blocking.
+fn codex_apply_mtime_race_heuristic(agent_run: &mut AgentRunResult, working_dir: &str) {
+    let workdir = PathBuf::from(working_dir);
+    let now = SystemTime::now();
+    let threshold = Duration::from_secs(CODEX_MTIME_RACE_WINDOW_SECS);
+
+    // At this point we don't yet have a `Repository` handle (that happens
+    // further downstream), so we can't use `git status` to enumerate dirty
+    // files.  Instead we do a lightweight recursive walk of the working
+    // directory, skipping hidden dirs (`.git`, etc.), and collect every file
+    // whose mtime falls within the race window.
+    let recent = codex_collect_recently_modified_files(&workdir, &now, &threshold);
+
+    if !recent.is_empty() {
+        debug_log(&format!(
+            "codex mtime race: {} file(s) modified within {}s window",
+            recent.len(),
+            CODEX_MTIME_RACE_WINDOW_SECS,
+        ));
+        agent_run.edited_filepaths = Some(recent);
+    }
+}
+
+/// Recursively collect files under `dir` whose mtime is within `threshold` of
+/// `now`.  Skips `.git` and hidden directories.  Returns paths relative to
+/// `root` (the repository working directory).
+fn codex_collect_recently_modified_files(
+    root: &PathBuf,
+    now: &SystemTime,
+    threshold: &Duration,
+) -> Vec<String> {
+    let mut recent = Vec::new();
+    codex_walk_dir_for_recent_files(root, root, now, threshold, &mut recent, 0, 10);
+    recent
+}
+
+fn codex_walk_dir_for_recent_files(
+    root: &PathBuf,
+    dir: &PathBuf,
+    now: &SystemTime,
+    threshold: &Duration,
+    out: &mut Vec<String>,
+    depth: usize,
+    max_depth: usize,
+) {
+    if depth > max_depth {
+        return;
+    }
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        // Skip .git and hidden directories
+        if name_str.starts_with('.') {
+            continue;
+        }
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        if metadata.is_dir() {
+            codex_walk_dir_for_recent_files(
+                root,
+                &entry.path(),
+                now,
+                threshold,
+                out,
+                depth + 1,
+                max_depth,
+            );
+        } else if metadata.is_file()
+            && let Ok(mtime) = metadata.modified()
+        {
+            let elapsed = now.duration_since(mtime).unwrap_or(Duration::ZERO);
+            if elapsed < *threshold {
+                // Store path relative to root, using forward slashes (POSIX)
+                if let Ok(rel) = entry.path().strip_prefix(root) {
+                    let rel_str = rel.to_string_lossy().replace('\\', "/");
+                    debug_log(&format!(
+                        "codex mtime race: {} modified {:.2}s ago",
+                        rel_str,
+                        elapsed.as_secs_f64(),
+                    ));
+                    out.push(rel_str);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod codex_mtime_tests {
+    use super::*;
+    use std::time::UNIX_EPOCH;
+
+    use crate::authorship::working_log::{AgentId, CheckpointKind};
+    use crate::commands::checkpoint_agent::agent_presets::AgentRunResult;
+
+    fn dummy_agent_run() -> AgentRunResult {
+        AgentRunResult {
+            agent_id: AgentId {
+                tool: "codex".to_string(),
+                id: "test-session".to_string(),
+                model: "o4-mini".to_string(),
+            },
+            agent_metadata: None,
+            checkpoint_kind: CheckpointKind::AiAgent,
+            transcript: None,
+            repo_working_dir: None,
+            edited_filepaths: None,
+            will_edit_filepaths: None,
+            dirty_files: None,
+        }
+    }
+
+    #[test]
+    fn test_collect_recently_modified_finds_fresh_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+
+        // Write a file just now — its mtime should be within the window.
+        std::fs::write(root.join("fresh.txt"), "hello\n").unwrap();
+
+        let now = SystemTime::now();
+        let threshold = Duration::from_secs(CODEX_MTIME_RACE_WINDOW_SECS);
+        let result = codex_collect_recently_modified_files(&root, &now, &threshold);
+
+        assert!(
+            result.contains(&"fresh.txt".to_string()),
+            "Freshly-written file should be detected; got: {:?}",
+            result,
+        );
+    }
+
+    #[test]
+    fn test_collect_recently_modified_ignores_old_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+
+        let file_path = root.join("old.txt");
+        std::fs::write(&file_path, "old\n").unwrap();
+
+        // Backdate mtime to well beyond the race window.
+        let old_time = filetime::FileTime::from_unix_time(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as i64
+                - 60,
+            0,
+        );
+        filetime::set_file_mtime(&file_path, old_time).unwrap();
+
+        let now = SystemTime::now();
+        let threshold = Duration::from_secs(CODEX_MTIME_RACE_WINDOW_SECS);
+        let result = codex_collect_recently_modified_files(&root, &now, &threshold);
+
+        assert!(
+            result.is_empty(),
+            "Old file should not be detected; got: {:?}",
+            result,
+        );
+    }
+
+    #[test]
+    fn test_collect_recently_modified_skips_hidden_dirs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+
+        // Create a .git directory with a fresh file inside.
+        let git_dir = root.join(".git");
+        std::fs::create_dir_all(&git_dir).unwrap();
+        std::fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+
+        // Also create a visible fresh file.
+        std::fs::write(root.join("visible.txt"), "v\n").unwrap();
+
+        let now = SystemTime::now();
+        let threshold = Duration::from_secs(CODEX_MTIME_RACE_WINDOW_SECS);
+        let result = codex_collect_recently_modified_files(&root, &now, &threshold);
+
+        assert!(
+            !result.iter().any(|p| p.contains(".git")),
+            "Files inside .git should be skipped; got: {:?}",
+            result,
+        );
+        assert!(
+            result.contains(&"visible.txt".to_string()),
+            "Visible fresh file should be found; got: {:?}",
+            result,
+        );
+    }
+
+    #[test]
+    fn test_collect_recently_modified_finds_nested_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+
+        let subdir = root.join("src").join("lib");
+        std::fs::create_dir_all(&subdir).unwrap();
+        std::fs::write(subdir.join("nested.rs"), "fn main() {}\n").unwrap();
+
+        let now = SystemTime::now();
+        let threshold = Duration::from_secs(CODEX_MTIME_RACE_WINDOW_SECS);
+        let result = codex_collect_recently_modified_files(&root, &now, &threshold);
+
+        assert!(
+            result.contains(&"src/lib/nested.rs".to_string()),
+            "Nested fresh file should be found with forward-slash path; got: {:?}",
+            result,
+        );
+    }
+
+    #[test]
+    fn test_collect_recently_modified_mixed_old_and_new() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+
+        // Old file
+        let old_path = root.join("old.txt");
+        std::fs::write(&old_path, "old\n").unwrap();
+        let old_time = filetime::FileTime::from_unix_time(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as i64
+                - 120,
+            0,
+        );
+        filetime::set_file_mtime(&old_path, old_time).unwrap();
+
+        // New file
+        std::fs::write(root.join("new.txt"), "new\n").unwrap();
+
+        let now = SystemTime::now();
+        let threshold = Duration::from_secs(CODEX_MTIME_RACE_WINDOW_SECS);
+        let result = codex_collect_recently_modified_files(&root, &now, &threshold);
+
+        assert!(
+            result.contains(&"new.txt".to_string()),
+            "New file should be detected; got: {:?}",
+            result,
+        );
+        assert!(
+            !result.contains(&"old.txt".to_string()),
+            "Old file should not be detected; got: {:?}",
+            result,
+        );
+    }
+
+    #[test]
+    fn test_collect_recently_modified_empty_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+
+        let now = SystemTime::now();
+        let threshold = Duration::from_secs(CODEX_MTIME_RACE_WINDOW_SECS);
+        let result = codex_collect_recently_modified_files(&root, &now, &threshold);
+
+        assert!(
+            result.is_empty(),
+            "Empty directory should return no files; got: {:?}",
+            result,
+        );
+    }
+
+    #[test]
+    fn test_apply_mtime_race_heuristic_sets_edited_filepaths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+
+        // Write a fresh file to simulate Codex having written it.
+        std::fs::write(root.join("codex_output.py"), "print('hello')\n").unwrap();
+
+        let mut agent_run = dummy_agent_run();
+        assert!(agent_run.edited_filepaths.is_none());
+
+        codex_apply_mtime_race_heuristic(&mut agent_run, root.to_str().unwrap());
+
+        assert!(
+            agent_run.edited_filepaths.is_some(),
+            "edited_filepaths should be populated when fresh files exist",
+        );
+        let paths = agent_run.edited_filepaths.unwrap();
+        assert!(
+            paths.contains(&"codex_output.py".to_string()),
+            "Should contain the freshly-written file; got: {:?}",
+            paths,
+        );
+    }
+
+    #[test]
+    fn test_apply_mtime_race_heuristic_noop_when_no_recent_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+
+        // Write a file and backdate it.
+        let file_path = root.join("stale.txt");
+        std::fs::write(&file_path, "stale\n").unwrap();
+        let old_time = filetime::FileTime::from_unix_time(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as i64
+                - 30,
+            0,
+        );
+        filetime::set_file_mtime(&file_path, old_time).unwrap();
+
+        let mut agent_run = dummy_agent_run();
+        codex_apply_mtime_race_heuristic(&mut agent_run, root.to_str().unwrap());
+
+        assert!(
+            agent_run.edited_filepaths.is_none(),
+            "edited_filepaths should remain None when no recent files",
+        );
+    }
+
+    #[test]
+    fn test_apply_mtime_race_heuristic_nonexistent_dir() {
+        let mut agent_run = dummy_agent_run();
+        codex_apply_mtime_race_heuristic(&mut agent_run, "/nonexistent/dir/that/does/not/exist");
+        assert!(
+            agent_run.edited_filepaths.is_none(),
+            "Nonexistent directory should not cause errors",
+        );
     }
 }
 
