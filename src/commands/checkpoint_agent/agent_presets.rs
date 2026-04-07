@@ -250,16 +250,11 @@ impl AgentCheckpointPreset for ClaudePreset {
         let agent_metadata =
             HashMap::from([("transcript_path".to_string(), transcript_path.to_string())]);
 
-        // Check if this is a PreToolUse event (human checkpoint)
         let hook_event_name = hook_data
             .get("hook_event_name")
             .or_else(|| hook_data.get("hookEventName"))
-            .and_then(|v| v.as_str());
-
-        // Determine if this is a bash tool invocation
-        let is_bash_tool = tool_name
-            .map(|name| bash_tool::classify_tool(Agent::Claude, name) == ToolClass::Bash)
-            .unwrap_or(false);
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
 
         // Extract session_id for bash tool snapshot correlation
         let session_id = hook_data
@@ -273,19 +268,17 @@ impl AgentCheckpointPreset for ClaudePreset {
             .and_then(|v| v.as_str())
             .unwrap_or("bash");
 
-        if hook_event_name == Some("PreToolUse") {
-            let pre_hook_captured_id = prepare_agent_bash_pre_hook(
-                is_bash_tool,
-                Some(cwd),
-                session_id,
-                tool_use_id,
-                &agent_id,
-                Some(&agent_metadata),
-                BashPreHookStrategy::EmitHumanCheckpoint,
-            )?
-            .captured_checkpoint_id();
+        let bash = bash_tool::integrate_bash_tool(
+            Agent::Claude,
+            tool_name,
+            hook_event_name,
+            Some(Path::new(cwd)),
+            session_id,
+            tool_use_id,
+            file_path_as_vec.clone(),
+        );
 
-            // Early return for human checkpoint
+        if hook_event_name == "PreToolUse" {
             return Ok(AgentRunResult {
                 agent_id,
                 agent_metadata: None,
@@ -295,45 +288,9 @@ impl AgentCheckpointPreset for ClaudePreset {
                 edited_filepaths: None,
                 will_edit_filepaths: file_path_as_vec,
                 dirty_files: None,
-                captured_checkpoint_id: pre_hook_captured_id,
+                captured_checkpoint_id: bash.pre_hook_capture_id,
             });
         }
-
-        // PostToolUse: for bash tools, diff snapshots to detect changed files
-        let bash_result = if is_bash_tool {
-            let repo_root = Path::new(cwd);
-            Some(bash_tool::handle_bash_tool(
-                HookEvent::PostToolUse,
-                repo_root,
-                session_id,
-                tool_use_id,
-            ))
-        } else {
-            None
-        };
-        let edited_filepaths = if is_bash_tool {
-            match bash_result.as_ref().unwrap().as_ref().map(|r| &r.action) {
-                Ok(BashCheckpointAction::Checkpoint(paths)) => Some(paths.clone()),
-                Ok(BashCheckpointAction::NoChanges) => None,
-                Ok(BashCheckpointAction::Fallback) => {
-                    // snapshot unavailable or repo too large; no paths to report
-                    None
-                }
-                Ok(BashCheckpointAction::TakePreSnapshot) => None, // shouldn't happen on post
-                Err(e) => {
-                    crate::utils::debug_log(&format!("Bash tool post-hook error: {}", e));
-                    None
-                }
-            }
-        } else {
-            file_path_as_vec
-        };
-
-        let bash_captured_checkpoint_id = bash_result
-            .as_ref()
-            .and_then(|r| r.as_ref().ok())
-            .and_then(|r| r.captured_checkpoint.as_ref())
-            .map(|info| info.capture_id.clone());
 
         Ok(AgentRunResult {
             agent_id,
@@ -341,10 +298,10 @@ impl AgentCheckpointPreset for ClaudePreset {
             checkpoint_kind: CheckpointKind::AiAgent,
             transcript: Some(transcript),
             repo_working_dir: Some(cwd.to_string()),
-            edited_filepaths,
+            edited_filepaths: bash.edited_filepaths,
             will_edit_filepaths: None,
             dirty_files: None,
-            captured_checkpoint_id: bash_captured_checkpoint_id,
+            captured_checkpoint_id: bash.post_hook_capture_id,
         })
     }
 }
@@ -971,16 +928,11 @@ impl AgentCheckpointPreset for GeminiPreset {
         let agent_metadata =
             HashMap::from([("transcript_path".to_string(), transcript_path.to_string())]);
 
-        // Check if this is a PreToolUse event (human checkpoint)
         let hook_event_name = hook_data
             .get("hook_event_name")
             .or_else(|| hook_data.get("hookEventName"))
-            .and_then(|v| v.as_str());
-
-        // Determine if this is a bash tool invocation
-        let is_bash_tool = tool_name
-            .map(|name| bash_tool::classify_tool(Agent::Gemini, name) == ToolClass::Bash)
-            .unwrap_or(false);
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
 
         let tool_use_id = hook_data
             .get("tool_use_id")
@@ -988,18 +940,17 @@ impl AgentCheckpointPreset for GeminiPreset {
             .and_then(|v| v.as_str())
             .unwrap_or("bash");
 
-        if hook_event_name == Some("BeforeTool") {
-            let pre_hook_captured_id = prepare_agent_bash_pre_hook(
-                is_bash_tool,
-                Some(cwd),
-                session_id,
-                tool_use_id,
-                &agent_id,
-                Some(&agent_metadata),
-                BashPreHookStrategy::EmitHumanCheckpoint,
-            )?
-            .captured_checkpoint_id();
-            // Early return for human checkpoint
+        let bash = bash_tool::integrate_bash_tool(
+            Agent::Gemini,
+            tool_name,
+            hook_event_name,
+            Some(Path::new(cwd)),
+            session_id,
+            tool_use_id,
+            file_path_as_vec.clone(),
+        );
+
+        if hook_event_name == "BeforeTool" {
             return Ok(AgentRunResult {
                 agent_id,
                 agent_metadata: None,
@@ -1009,45 +960,9 @@ impl AgentCheckpointPreset for GeminiPreset {
                 edited_filepaths: None,
                 will_edit_filepaths: file_path_as_vec,
                 dirty_files: None,
-                captured_checkpoint_id: pre_hook_captured_id,
+                captured_checkpoint_id: bash.pre_hook_capture_id,
             });
         }
-
-        // PostToolUse: for bash tools, diff snapshots to detect changed files
-        let bash_result = if is_bash_tool {
-            let repo_root = Path::new(cwd);
-            Some(bash_tool::handle_bash_tool(
-                HookEvent::PostToolUse,
-                repo_root,
-                session_id,
-                tool_use_id,
-            ))
-        } else {
-            None
-        };
-        let edited_filepaths = if is_bash_tool {
-            match bash_result.as_ref().unwrap().as_ref().map(|r| &r.action) {
-                Ok(BashCheckpointAction::Checkpoint(paths)) => Some(paths.clone()),
-                Ok(BashCheckpointAction::NoChanges) => None,
-                Ok(BashCheckpointAction::Fallback) => {
-                    // snapshot unavailable or repo too large; no paths to report
-                    None
-                }
-                Ok(BashCheckpointAction::TakePreSnapshot) => None,
-                Err(e) => {
-                    crate::utils::debug_log(&format!("Bash tool post-hook error: {}", e));
-                    None
-                }
-            }
-        } else {
-            file_path_as_vec
-        };
-
-        let bash_captured_checkpoint_id = bash_result
-            .as_ref()
-            .and_then(|r| r.as_ref().ok())
-            .and_then(|r| r.captured_checkpoint.as_ref())
-            .map(|info| info.capture_id.clone());
 
         Ok(AgentRunResult {
             agent_id,
@@ -1055,10 +970,10 @@ impl AgentCheckpointPreset for GeminiPreset {
             checkpoint_kind: CheckpointKind::AiAgent,
             transcript: Some(transcript),
             repo_working_dir: Some(cwd.to_string()),
-            edited_filepaths,
+            edited_filepaths: bash.edited_filepaths,
             will_edit_filepaths: None,
             dirty_files: None,
-            captured_checkpoint_id: bash_captured_checkpoint_id,
+            captured_checkpoint_id: bash.post_hook_capture_id,
         })
     }
 }
@@ -1104,11 +1019,14 @@ impl AgentCheckpointPreset for ContinueCliPreset {
             .map(|s| s.to_string())
             .unwrap_or_else(|| {
                 eprintln!("[Warning] Continue CLI: 'model' field not found in hook_input, defaulting to 'unknown'");
-                eprintln!("[Debug] hook_data keys: {:?}", hook_data.as_object().map(|obj| obj.keys().collect::<Vec<_>>()));
+                crate::utils::debug_log(&format!(
+                    "hook_data keys: {:?}",
+                    hook_data.as_object().map(|obj| obj.keys().collect::<Vec<_>>())
+                ));
                 "unknown".to_string()
             });
 
-        eprintln!("[Debug] Continue CLI using model: {}", model);
+        crate::utils::debug_log(&format!("Continue CLI using model: {}", model));
 
         // Parse transcript from JSON file
         let transcript = match ContinueCliPreset::transcript_from_continue_json(transcript_path) {
@@ -1144,13 +1062,10 @@ impl AgentCheckpointPreset for ContinueCliPreset {
         let agent_metadata =
             HashMap::from([("transcript_path".to_string(), transcript_path.to_string())]);
 
-        // Check if this is a PreToolUse event (human checkpoint)
-        let hook_event_name = hook_data.get("hook_event_name").and_then(|v| v.as_str());
-
-        // Determine if this is a bash tool invocation
-        let is_bash_tool = tool_name
-            .map(|name| bash_tool::classify_tool(Agent::ContinueCli, name) == ToolClass::Bash)
-            .unwrap_or(false);
+        let hook_event_name = hook_data
+            .get("hook_event_name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
 
         let tool_use_id = hook_data
             .get("tool_use_id")
@@ -1158,18 +1073,17 @@ impl AgentCheckpointPreset for ContinueCliPreset {
             .and_then(|v| v.as_str())
             .unwrap_or("bash");
 
-        if hook_event_name == Some("PreToolUse") {
-            let pre_hook_captured_id = prepare_agent_bash_pre_hook(
-                is_bash_tool,
-                Some(cwd),
-                session_id,
-                tool_use_id,
-                &agent_id,
-                Some(&agent_metadata),
-                BashPreHookStrategy::EmitHumanCheckpoint,
-            )?
-            .captured_checkpoint_id();
-            // Early return for human checkpoint
+        let bash = bash_tool::integrate_bash_tool(
+            Agent::ContinueCli,
+            tool_name,
+            hook_event_name,
+            Some(Path::new(cwd)),
+            session_id,
+            tool_use_id,
+            file_path_as_vec.clone(),
+        );
+
+        if hook_event_name == "PreToolUse" {
             return Ok(AgentRunResult {
                 agent_id,
                 agent_metadata: None,
@@ -1179,45 +1093,9 @@ impl AgentCheckpointPreset for ContinueCliPreset {
                 edited_filepaths: None,
                 will_edit_filepaths: file_path_as_vec,
                 dirty_files: None,
-                captured_checkpoint_id: pre_hook_captured_id,
+                captured_checkpoint_id: bash.pre_hook_capture_id,
             });
         }
-
-        // PostToolUse: for bash tools, diff snapshots to detect changed files
-        let bash_result = if is_bash_tool {
-            let repo_root = Path::new(cwd);
-            Some(bash_tool::handle_bash_tool(
-                HookEvent::PostToolUse,
-                repo_root,
-                session_id,
-                tool_use_id,
-            ))
-        } else {
-            None
-        };
-        let edited_filepaths = if is_bash_tool {
-            match bash_result.as_ref().unwrap().as_ref().map(|r| &r.action) {
-                Ok(BashCheckpointAction::Checkpoint(paths)) => Some(paths.clone()),
-                Ok(BashCheckpointAction::NoChanges) => None,
-                Ok(BashCheckpointAction::Fallback) => {
-                    // snapshot unavailable or repo too large; no paths to report
-                    None
-                }
-                Ok(BashCheckpointAction::TakePreSnapshot) => None,
-                Err(e) => {
-                    crate::utils::debug_log(&format!("Bash tool post-hook error: {}", e));
-                    None
-                }
-            }
-        } else {
-            file_path_as_vec
-        };
-
-        let bash_captured_checkpoint_id = bash_result
-            .as_ref()
-            .and_then(|r| r.as_ref().ok())
-            .and_then(|r| r.captured_checkpoint.as_ref())
-            .map(|info| info.capture_id.clone());
 
         Ok(AgentRunResult {
             agent_id,
@@ -1225,10 +1103,10 @@ impl AgentCheckpointPreset for ContinueCliPreset {
             checkpoint_kind: CheckpointKind::AiAgent,
             transcript: Some(transcript),
             repo_working_dir: Some(cwd.to_string()),
-            edited_filepaths,
+            edited_filepaths: bash.edited_filepaths,
             will_edit_filepaths: None,
             dirty_files: None,
-            captured_checkpoint_id: bash_captured_checkpoint_id,
+            captured_checkpoint_id: bash.post_hook_capture_id,
         })
     }
 }
@@ -3175,29 +3053,23 @@ impl AgentCheckpointPreset for DroidPreset {
             agent_metadata.insert("tool_name".to_string(), name.to_string());
         }
 
-        // Determine if this is a bash tool invocation
-        let is_bash_tool = tool_name
-            .map(|name| bash_tool::classify_tool(Agent::Droid, name) == ToolClass::Bash)
-            .unwrap_or(false);
-
         let tool_use_id = hook_data
             .get("tool_use_id")
             .or_else(|| hook_data.get("toolUseId"))
             .and_then(|v| v.as_str())
             .unwrap_or("bash");
 
-        // Check if this is a PreToolUse event (human checkpoint)
+        let bash = bash_tool::integrate_bash_tool(
+            Agent::Droid,
+            tool_name,
+            hook_event_name,
+            Some(Path::new(cwd)),
+            &agent_id.id,
+            tool_use_id,
+            file_path_as_vec.clone(),
+        );
+
         if hook_event_name == "PreToolUse" {
-            let pre_hook_captured_id = prepare_agent_bash_pre_hook(
-                is_bash_tool,
-                Some(cwd),
-                &agent_id.id,
-                tool_use_id,
-                &agent_id,
-                Some(&agent_metadata),
-                BashPreHookStrategy::EmitHumanCheckpoint,
-            )?
-            .captured_checkpoint_id();
             return Ok(AgentRunResult {
                 agent_id,
                 agent_metadata: None,
@@ -3207,45 +3079,9 @@ impl AgentCheckpointPreset for DroidPreset {
                 edited_filepaths: None,
                 will_edit_filepaths: file_path_as_vec,
                 dirty_files: None,
-                captured_checkpoint_id: pre_hook_captured_id,
+                captured_checkpoint_id: bash.pre_hook_capture_id,
             });
         }
-
-        // PostToolUse: for bash tools, diff snapshots to detect changed files
-        let bash_result = if is_bash_tool {
-            let repo_root = Path::new(cwd);
-            Some(bash_tool::handle_bash_tool(
-                HookEvent::PostToolUse,
-                repo_root,
-                &agent_id.id,
-                tool_use_id,
-            ))
-        } else {
-            None
-        };
-        let edited_filepaths = if is_bash_tool {
-            match bash_result.as_ref().unwrap().as_ref().map(|r| &r.action) {
-                Ok(BashCheckpointAction::Checkpoint(paths)) => Some(paths.clone()),
-                Ok(BashCheckpointAction::NoChanges) => None,
-                Ok(BashCheckpointAction::Fallback) => {
-                    // snapshot unavailable or repo too large; no paths to report
-                    None
-                }
-                Ok(BashCheckpointAction::TakePreSnapshot) => None,
-                Err(e) => {
-                    crate::utils::debug_log(&format!("Bash tool post-hook error: {}", e));
-                    None
-                }
-            }
-        } else {
-            file_path_as_vec
-        };
-
-        let bash_captured_checkpoint_id = bash_result
-            .as_ref()
-            .and_then(|r| r.as_ref().ok())
-            .and_then(|r| r.captured_checkpoint.as_ref())
-            .map(|info| info.capture_id.clone());
 
         // PostToolUse event - AI checkpoint
         Ok(AgentRunResult {
@@ -3254,10 +3090,10 @@ impl AgentCheckpointPreset for DroidPreset {
             checkpoint_kind: CheckpointKind::AiAgent,
             transcript: Some(transcript),
             repo_working_dir: Some(cwd.to_string()),
-            edited_filepaths,
+            edited_filepaths: bash.edited_filepaths,
             will_edit_filepaths: None,
             dirty_files: None,
-            captured_checkpoint_id: bash_captured_checkpoint_id,
+            captured_checkpoint_id: bash.post_hook_capture_id,
         })
     }
 }
@@ -4182,7 +4018,6 @@ impl AgentCheckpointPreset for FirebenderPreset {
         if tool_class == ToolClass::Skip {
             std::process::exit(0);
         }
-        let is_bash_tool = tool_class == ToolClass::Bash;
 
         let repo_working_dir = repo_working_dir
             .map(|s| s.trim().to_string())
@@ -4220,17 +4055,17 @@ impl AgentCheckpointPreset for FirebenderPreset {
             model,
         };
 
+        let bash = bash_tool::integrate_bash_tool(
+            Agent::Firebender,
+            Some(tool_name.as_str()),
+            &hook_event_name,
+            repo_working_dir.as_deref().map(Path::new),
+            &session_id,
+            "bash",
+            file_paths.clone(),
+        );
+
         if hook_event_name == "preToolUse" {
-            let pre_hook_captured_id = prepare_agent_bash_pre_hook(
-                is_bash_tool,
-                repo_working_dir.as_deref(),
-                &session_id,
-                "bash",
-                &agent_id,
-                None,
-                BashPreHookStrategy::EmitHumanCheckpoint,
-            )?
-            .captured_checkpoint_id();
             return Ok(AgentRunResult {
                 agent_id,
                 agent_metadata: None,
@@ -4238,44 +4073,11 @@ impl AgentCheckpointPreset for FirebenderPreset {
                 transcript: None,
                 repo_working_dir,
                 edited_filepaths: None,
-                will_edit_filepaths: file_paths.clone(),
+                will_edit_filepaths: file_paths,
                 dirty_files,
-                captured_checkpoint_id: pre_hook_captured_id,
+                captured_checkpoint_id: bash.pre_hook_capture_id,
             });
         }
-
-        let bash_result = if is_bash_tool {
-            repo_working_dir.as_deref().map(|cwd| {
-                bash_tool::handle_bash_tool(
-                    HookEvent::PostToolUse,
-                    Path::new(cwd),
-                    &session_id,
-                    "bash",
-                )
-            })
-        } else {
-            None
-        };
-        let edited_filepaths = if is_bash_tool {
-            match bash_result
-                .as_ref()
-                .and_then(|r| r.as_ref().ok())
-                .map(|r| &r.action)
-            {
-                Some(BashCheckpointAction::Checkpoint(paths)) => Some(paths.clone()),
-                Some(BashCheckpointAction::NoChanges)
-                | Some(BashCheckpointAction::TakePreSnapshot)
-                | Some(BashCheckpointAction::Fallback)
-                | None => None,
-            }
-        } else {
-            file_paths
-        };
-        let bash_captured_checkpoint_id = bash_result
-            .as_ref()
-            .and_then(|r| r.as_ref().ok())
-            .and_then(|r| r.captured_checkpoint.as_ref())
-            .map(|info| info.capture_id.clone());
 
         Ok(AgentRunResult {
             agent_id,
@@ -4283,10 +4085,10 @@ impl AgentCheckpointPreset for FirebenderPreset {
             checkpoint_kind: CheckpointKind::AiAgent,
             transcript: None,
             repo_working_dir,
-            edited_filepaths,
+            edited_filepaths: bash.edited_filepaths,
             will_edit_filepaths: None,
             dirty_files,
-            captured_checkpoint_id: bash_captured_checkpoint_id,
+            captured_checkpoint_id: bash.post_hook_capture_id,
         })
     }
 }
