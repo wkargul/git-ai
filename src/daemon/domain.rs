@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct FamilyKey(pub String);
@@ -267,7 +268,7 @@ pub struct FamilyState {
     pub last_error: Option<String>,
     pub applied_seq: u64,
     #[serde(default)]
-    pub watermarks: WatermarkState,
+    pub watermarks: Arc<WatermarkState>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

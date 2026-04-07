@@ -6,6 +6,7 @@ use crate::daemon::domain::{
 use crate::daemon::reducer;
 use crate::error::GitAiError;
 use std::collections::HashMap;
+use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 
 pub enum FamilyMsg {
@@ -15,7 +16,7 @@ pub enum FamilyMsg {
     ),
     ApplyCheckpoint(oneshot::Sender<Result<ApplyAck, GitAiError>>),
     Status(oneshot::Sender<Result<FamilyStatus, GitAiError>>),
-    GetWatermarks(oneshot::Sender<Result<WatermarkState, GitAiError>>),
+    GetWatermarks(oneshot::Sender<Result<Arc<WatermarkState>, GitAiError>>),
     UpdateWatermarks(WatermarkState),
     Shutdown,
 }
@@ -58,7 +59,7 @@ impl FamilyActorHandle {
             .map_err(|_| GitAiError::Generic("family actor status receive failed".to_string()))?
     }
 
-    pub async fn watermarks(&self) -> Result<WatermarkState, GitAiError> {
+    pub async fn watermarks(&self) -> Result<Arc<WatermarkState>, GitAiError> {
         let (tx, rx) = oneshot::channel();
         self.tx
             .send(FamilyMsg::GetWatermarks(tx))
@@ -101,7 +102,7 @@ pub fn spawn_family_actor(family_key: FamilyKey) -> FamilyActorHandle {
             worktrees: HashMap::new(),
             last_error: None,
             applied_seq: 0,
-            watermarks: WatermarkState::default(),
+            watermarks: Arc::new(WatermarkState::default()),
         };
 
         while let Some(msg) = rx.recv().await {
@@ -126,24 +127,38 @@ pub fn spawn_family_actor(family_key: FamilyKey) -> FamilyActorHandle {
                     }));
                 }
                 FamilyMsg::GetWatermarks(respond_to) => {
-                    let _ = respond_to.send(Ok(state.watermarks.clone()));
+                    let _ = respond_to.send(Ok(Arc::clone(&state.watermarks)));
                 }
                 FamilyMsg::UpdateWatermarks(update) => {
+                    let wm = Arc::make_mut(&mut state.watermarks);
+
                     for (path, mtime_ns) in update.per_file {
-                        let entry = state.watermarks.per_file.entry(path).or_insert(0);
+                        let entry = wm.per_file.entry(path).or_insert(0);
                         if mtime_ns > *entry {
                             *entry = mtime_ns;
                         }
                     }
                     for (worktree, ts) in update.per_worktree {
-                        let entry = state.watermarks.per_worktree.entry(worktree).or_insert(0);
-                        if ts > *entry {
-                            *entry = ts;
+                        let current = wm.per_worktree.entry(worktree).or_insert(0);
+                        if ts > *current {
+                            *current = ts;
                             // Prune per-file watermarks superseded by this worktree watermark.
                             // A per-file entry older than worktree_wm would cause Tier 1 false
                             // positives: the file would appear stale even though it was captured
                             // by the full human checkpoint at worktree_wm.
-                            state.watermarks.per_file.retain(|_, file_ts| *file_ts > ts);
+                            wm.per_file.retain(|_, file_ts| *file_ts > ts);
+                        }
+                    }
+
+                    // Eviction cap: if per_file exceeds 10k entries, drop oldest
+                    const MAX_PER_FILE_ENTRIES: usize = 10_000;
+                    if wm.per_file.len() > MAX_PER_FILE_ENTRIES {
+                        let mut entries: Vec<_> =
+                            wm.per_file.iter().map(|(k, v)| (k.clone(), *v)).collect();
+                        entries.sort_by_key(|(_, ts)| *ts);
+                        let to_remove = entries.len() - MAX_PER_FILE_ENTRIES;
+                        for (key, _) in entries.into_iter().take(to_remove) {
+                            wm.per_file.remove(&key);
                         }
                     }
                 }

@@ -166,6 +166,7 @@ mod tests {
         CommandScope, Confidence, FamilyKey, FamilyState, GlobalState, RefChange, WatermarkState,
     };
     use std::collections::HashMap;
+    use std::sync::Arc;
 
     fn family_state() -> FamilyState {
         FamilyState {
@@ -174,7 +175,7 @@ mod tests {
             worktrees: HashMap::new(),
             last_error: None,
             applied_seq: 0,
-            watermarks: WatermarkState::default(),
+            watermarks: Arc::new(WatermarkState::default()),
         }
     }
 

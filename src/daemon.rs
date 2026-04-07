@@ -6938,7 +6938,7 @@ impl ActorDaemonCoordinator {
     async fn watermarks_for_family(
         &self,
         repo_working_dir: String,
-    ) -> Result<crate::daemon::domain::WatermarkState, GitAiError> {
+    ) -> Result<Arc<crate::daemon::domain::WatermarkState>, GitAiError> {
         self.coordinator
             .watermarks_family(Path::new(&repo_working_dir))
             .await
