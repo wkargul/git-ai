@@ -7,9 +7,15 @@ use crate::mdm::utils::binary_exists;
 pub struct VimInstaller;
 
 impl HookInstaller for VimInstaller {
-    fn name(&self) -> &str { "Vim" }
-    fn id(&self) -> &str { "vim" }
-    fn uses_config_hooks(&self) -> bool { false }
+    fn name(&self) -> &str {
+        "Vim"
+    }
+    fn id(&self) -> &str {
+        "vim"
+    }
+    fn uses_config_hooks(&self) -> bool {
+        false
+    }
 
     fn check_hooks(&self, _params: &HookInstallerParams) -> Result<HookCheckResult, GitAiError> {
         let tool_installed = binary_exists("vim") || binary_exists("gvim");
@@ -58,7 +64,8 @@ impl HookInstaller for VimInstaller {
                 "  Vundle (~/.vimrc):\n",
                 "    Plugin 'git-ai-project/git-ai'\n",
                 "    (also add: set rtp+=~/.vim/bundle/git-ai/agent-support/vim)",
-            ).to_string(),
+            )
+            .to_string(),
         }])
     }
 }
@@ -82,6 +89,11 @@ mod tests {
         let params = HookInstallerParams {
             binary_path: std::path::PathBuf::from("/usr/local/bin/git-ai"),
         };
-        assert!(VimInstaller.install_hooks(&params, false).unwrap().is_none());
+        assert!(
+            VimInstaller
+                .install_hooks(&params, false)
+                .unwrap()
+                .is_none()
+        );
     }
 }

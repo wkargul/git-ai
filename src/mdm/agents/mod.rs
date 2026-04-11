@@ -8,8 +8,8 @@ mod gemini;
 mod github_copilot;
 mod jetbrains;
 mod opencode;
-mod vscode;
 mod vim;
+mod vscode;
 mod windsurf;
 
 pub use amp::AmpInstaller;
