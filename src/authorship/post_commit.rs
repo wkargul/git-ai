@@ -20,7 +20,9 @@ use std::io::IsTerminal;
 /// High hunk density is the strongest predictor of slow diff_ai_accepted_stats.
 const STATS_SKIP_MAX_HUNKS: usize = 1000;
 /// Skip expensive stats for very large net additions even if hunks are moderate.
-const STATS_SKIP_MAX_ADDED_LINES: usize = 6000;
+/// 10k is safe because the 1000-hunk guard already catches pathologically fragmented diffs;
+/// any commit reaching this check has large contiguous additions where git diff -U0 is fast.
+const STATS_SKIP_MAX_ADDED_LINES: usize = 10_000;
 /// Skip expensive stats for extremely wide commits touching many added-line files.
 const STATS_SKIP_MAX_FILES_WITH_ADDITIONS: usize = 200;
 
