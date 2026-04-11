@@ -2,7 +2,9 @@ use crate::error::GitAiError;
 use crate::mdm::hook_installer::{
     HookCheckResult, HookInstaller, HookInstallerParams, InstallResult, UninstallResult,
 };
-use crate::mdm::utils::{binary_exists, home_dir};
+use crate::mdm::utils::binary_exists;
+#[cfg(not(windows))]
+use crate::mdm::utils::home_dir;
 use std::fs;
 use std::path::PathBuf;
 
