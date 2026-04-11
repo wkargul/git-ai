@@ -7,9 +7,15 @@ use crate::mdm::utils::{binary_exists, home_dir};
 pub struct EclipseInstaller;
 
 impl HookInstaller for EclipseInstaller {
-    fn name(&self) -> &str { "Eclipse" }
-    fn id(&self) -> &str { "eclipse" }
-    fn uses_config_hooks(&self) -> bool { false }
+    fn name(&self) -> &str {
+        "Eclipse"
+    }
+    fn id(&self) -> &str {
+        "eclipse"
+    }
+    fn uses_config_hooks(&self) -> bool {
+        false
+    }
 
     fn check_hooks(&self, _params: &HookInstallerParams) -> Result<HookCheckResult, GitAiError> {
         // Detect Eclipse by binary or by presence of the Eclipse p2 provisioning metadata
@@ -18,9 +24,13 @@ impl HookInstaller for EclipseInstaller {
         // Check common Eclipse install locations
         let has_app = {
             #[cfg(target_os = "macos")]
-            { std::path::Path::new("/Applications/Eclipse.app").exists() }
+            {
+                std::path::Path::new("/Applications/Eclipse.app").exists()
+            }
             #[cfg(not(target_os = "macos"))]
-            { false }
+            {
+                false
+            }
         };
 
         let tool_installed = has_binary || has_p2 || has_app;
@@ -62,7 +72,8 @@ impl HookInstaller for EclipseInstaller {
                 "Install the plugin manually via Help → Install New Software → ",
                 "Add update site URL from https://github.com/git-ai-project/git-ai/releases, ",
                 "then restart Eclipse."
-            ).to_string(),
+            )
+            .to_string(),
         }])
     }
 }
@@ -86,6 +97,11 @@ mod tests {
         let params = HookInstallerParams {
             binary_path: std::path::PathBuf::from("/usr/local/bin/git-ai"),
         };
-        assert!(EclipseInstaller.install_hooks(&params, false).unwrap().is_none());
+        assert!(
+            EclipseInstaller
+                .install_hooks(&params, false)
+                .unwrap()
+                .is_none()
+        );
     }
 }
