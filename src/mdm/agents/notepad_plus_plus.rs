@@ -121,20 +121,22 @@ fn uninstall_plugin() -> UninstallResult {
 fn notepad_exe_path() -> Option<std::path::PathBuf> {
     // Check common install locations
     let candidates = [
-        std::env::var("ProgramFiles")
-            .ok()
-            .map(|p| std::path::PathBuf::from(p).join("Notepad++").join("notepad++.exe")),
-        std::env::var("ProgramFiles(x86)")
-            .ok()
-            .map(|p| std::path::PathBuf::from(p).join("Notepad++").join("notepad++.exe")),
-        std::env::var("LOCALAPPDATA")
-            .ok()
-            .map(|p| {
-                std::path::PathBuf::from(p)
-                    .join("Programs")
-                    .join("Notepad++")
-                    .join("notepad++.exe")
-            }),
+        std::env::var("ProgramFiles").ok().map(|p| {
+            std::path::PathBuf::from(p)
+                .join("Notepad++")
+                .join("notepad++.exe")
+        }),
+        std::env::var("ProgramFiles(x86)").ok().map(|p| {
+            std::path::PathBuf::from(p)
+                .join("Notepad++")
+                .join("notepad++.exe")
+        }),
+        std::env::var("LOCALAPPDATA").ok().map(|p| {
+            std::path::PathBuf::from(p)
+                .join("Programs")
+                .join("Notepad++")
+                .join("notepad++.exe")
+        }),
     ];
     for c in candidates.into_iter().flatten() {
         if c.exists() {
@@ -279,10 +281,12 @@ mod tests {
         let params = HookInstallerParams {
             binary_path: std::path::PathBuf::from("/usr/local/bin/git-ai"),
         };
-        assert!(NotepadPlusPlusInstaller
-            .install_hooks(&params, false)
-            .unwrap()
-            .is_none());
+        assert!(
+            NotepadPlusPlusInstaller
+                .install_hooks(&params, false)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[cfg(not(windows))]
