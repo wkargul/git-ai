@@ -18,7 +18,7 @@ impl HookInstaller for VimInstaller {
     }
 
     fn check_hooks(&self, _params: &HookInstallerParams) -> Result<HookCheckResult, GitAiError> {
-        let tool_installed = binary_exists("vim") || binary_exists("gvim");
+        let tool_installed = binary_exists("vim") || binary_exists("gvim") || binary_exists("nvim");
         Ok(HookCheckResult {
             tool_installed,
             hooks_installed: false,

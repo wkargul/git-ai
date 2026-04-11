@@ -68,20 +68,35 @@ function! s:BuildJsonPayload(root, files) abort
     let l:escaped_content = substitute(l:escaped_content, '"', '\\"', 'g')
     let l:escaped_content = substitute(l:escaped_content, "\n", '\\n', 'g')
     let l:escaped_content = substitute(l:escaped_content, "\r", '\\r', 'g')
+    let l:escaped_content = substitute(l:escaped_content, "\t", '\\t', 'g')
     let l:paths_json .= '"' . l:escaped_path . '"'
     let l:dirty_json .= '"' . l:escaped_path . '":"' . l:escaped_content . '"'
   endfor
   let l:paths_json .= ']'
   let l:dirty_json .= '}'
-  let l:version = string(v:version)
-  return '{"editor":"vim","editor_version":"' . l:version .
+  if has('nvim')
+    let l:editor = 'neovim'
+    " Neovim version: major.minor.patch
+    let l:editor_ver = luaeval('vim.version().major') . '.' .
+      \ luaeval('vim.version().minor') . '.' .
+      \ luaeval('vim.version().patch')
+  else
+    let l:editor = 'vim'
+    let l:editor_ver = string(v:version)
+  endif
+  let l:escaped_cwd = substitute(a:root, '\\', '\\\\', 'g')
+  let l:escaped_cwd = substitute(l:escaped_cwd, '"', '\\"', 'g')
+  return '{"editor":"' . l:editor . '","editor_version":"' . l:editor_ver .
     \ '","extension_version":"1.0.0","cwd":"' .
-    \ substitute(a:root, '"', '\\"', 'g') .
+    \ l:escaped_cwd .
     \ '","edited_filepaths":' . l:paths_json .
     \ ',"dirty_files":' . l:dirty_json . '}'
 endfunction
 
 function! s:FireCheckpoint(root) abort
+  if has_key(s:debounce_timers, a:root)
+    unlet s:debounce_timers[a:root]
+  endif
   if !has_key(s:pending_files, a:root)
     return
   endif
