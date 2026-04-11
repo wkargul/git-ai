@@ -46,22 +46,16 @@ impl HookInstaller for XcodeInstaller {
 
     fn install_extras(
         &self,
-        params: &HookInstallerParams,
+        _params: &HookInstallerParams,
         _dry_run: bool,
     ) -> Result<Vec<InstallResult>, GitAiError> {
-        let bin = params.binary_path.display();
         Ok(vec![InstallResult {
             changed: false,
             diff: None,
-            message: format!(
-                "Xcode: Automatic installation is not supported. \
-                 To enable known_human tracking, add the following to your Xcode scheme's \
-                 Pre-action (Product → Scheme → Edit Scheme → Build → Pre-actions):\n\
-                 \n\
-                 {bin}-xcode-watcher --path \"${{SRCROOT}}\"\n\
-                 \n\
-                 Or run as a background daemon — see docs for the launchd plist setup.",
-            ),
+            message: "Xcode: Install git-ai-xcode-watcher daemon. \
+                      Download from releases or build from agent-support/xcode/. \
+                      Run: launchctl load ~/Library/LaunchAgents/io.gitai.xcode-watcher.plist"
+                .to_string(),
         }])
     }
 }

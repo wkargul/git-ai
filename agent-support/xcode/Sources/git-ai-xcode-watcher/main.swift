@@ -5,6 +5,7 @@ import CoreServices
 var watchedPaths: [String] = []
 var pendingFiles: [String: [String: String]] = [:]  // repoRoot -> [path: content]
 var debounceItems: [String: DispatchWorkItem] = []  // repoRoot -> work item
+var repoRootCache: [String: String?] = [:]          // dir -> repoRoot (nil = not a repo)
 let queue = DispatchQueue(label: "io.gitai.xcode-watcher", qos: .utility)
 let gitAiBin: String = {
     let home = FileManager.default.homeDirectoryForCurrentUser.path
@@ -14,19 +15,29 @@ let gitAiBin: String = {
 }()
 
 // MARK: - Utilities
-func findRepoRoot(for path: String) -> String? {
+func findRepoRoot(for filePath: String) -> String? {
+    let dir = (filePath as NSString).deletingLastPathComponent
+    if let cached = repoRootCache[dir] {
+        return cached
+    }
     let proc = Process()
     proc.executableURL = URL(fileURLWithPath: "/usr/bin/git")
-    proc.arguments = ["-C", path, "rev-parse", "--show-toplevel"]
+    proc.arguments = ["-C", dir, "rev-parse", "--show-toplevel"]
     let pipe = Pipe()
     proc.standardOutput = pipe
     proc.standardError = Pipe()
     try? proc.run()
     proc.waitUntilExit()
-    guard proc.terminationStatus == 0 else { return nil }
-    let out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
-        .trimmingCharacters(in: .whitespacesAndNewlines)
-    return out?.isEmpty == false ? out : nil
+    let result: String?
+    if proc.terminationStatus == 0 {
+        let out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        result = out?.isEmpty == false ? out : nil
+    } else {
+        result = nil
+    }
+    repoRootCache[dir] = result
+    return result
 }
 
 func readFileContents(_ path: String) -> String? {
@@ -39,37 +50,36 @@ func shouldSkip(_ path: String) -> Bool {
 }
 
 func fireCheckpoint(repoRoot: String) {
-    queue.async {
-        guard let files = pendingFiles[repoRoot], !files.isEmpty else { return }
-        pendingFiles[repoRoot] = nil
+    guard let files = pendingFiles[repoRoot], !files.isEmpty else { return }
+    pendingFiles[repoRoot] = nil
 
-        let payload: [String: Any] = [
-            "editor": "xcode",
-            "editor_version": "unknown",
-            "extension_version": "1.0.0",
-            "cwd": repoRoot,
-            "edited_filepaths": Array(files.keys),
-            "dirty_files": files
-        ]
+    let payload: [String: Any] = [
+        "editor": "xcode",
+        "editor_version": "unknown",
+        "extension_version": "1.0.0",
+        "cwd": repoRoot,
+        "edited_filepaths": Array(files.keys),
+        "dirty_files": files
+    ]
 
-        guard let jsonData = try? JSONSerialization.data(withJSONObject: payload),
-              let jsonStr = String(data: jsonData, encoding: .utf8) else { return }
+    guard let jsonData = try? JSONSerialization.data(withJSONObject: payload),
+          let jsonStr = String(data: jsonData, encoding: .utf8) else { return }
 
-        let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: gitAiBin)
-        proc.arguments = ["checkpoint", "known_human", "--hook-input", "stdin"]
-        proc.currentDirectoryURL = URL(fileURLWithPath: repoRoot)
-        let stdinPipe = Pipe()
-        proc.standardInput = stdinPipe
-        proc.standardOutput = Pipe()
-        proc.standardError = Pipe()
-        try? proc.run()
-        stdinPipe.fileHandleForWriting.write(jsonStr.data(using: .utf8)!)
-        stdinPipe.fileHandleForWriting.closeFile()
-        proc.waitUntilExit()
-    }
+    let proc = Process()
+    proc.executableURL = URL(fileURLWithPath: gitAiBin)
+    proc.arguments = ["checkpoint", "known_human", "--hook-input", "stdin"]
+    proc.currentDirectoryURL = URL(fileURLWithPath: repoRoot)
+    let stdinPipe = Pipe()
+    proc.standardInput = stdinPipe
+    proc.standardOutput = Pipe()
+    proc.standardError = Pipe()
+    try? proc.run()
+    stdinPipe.fileHandleForWriting.write(jsonStr.data(using: .utf8)!)
+    stdinPipe.fileHandleForWriting.closeFile()
+    proc.waitUntilExit()
 }
 
+// Must be called on `queue`.
 func scheduleDebounce(repoRoot: String) {
     debounceItems[repoRoot]?.cancel()
     let item = DispatchWorkItem { fireCheckpoint(repoRoot: repoRoot) }
@@ -79,23 +89,31 @@ func scheduleDebounce(repoRoot: String) {
 
 // MARK: - FSEvents callback
 let callback: FSEventStreamCallback = { (_, _, numEvents, eventPaths, _, _) in
-    let paths = Unmanaged<CFArray>.fromOpaque(eventPaths).takeUnretainedValue() as! [String]
-    var roots = Set<String>()
+    guard let paths = Unmanaged<CFArray>.fromOpaque(eventPaths).takeUnretainedValue() as? [String] else { return }
+    // Collect candidate file paths on the RunLoop thread (cheap checks only).
+    var candidates: [String] = []
     for path in paths {
         guard !shouldSkip(path) else { continue }
         var isDir: ObjCBool = false
         guard FileManager.default.fileExists(atPath: path, isDirectory: &isDir),
               !isDir.boolValue else { continue }
-        let dir = (path as NSString).deletingLastPathComponent
-        guard let root = findRepoRoot(for: dir) else { continue }
-        guard let content = readFileContents(path) else { continue }
-        queue.sync {
+        candidates.append(path)
+    }
+    guard !candidates.isEmpty else { return }
+    // Dispatch all heavy work (git subprocess, file reads, debounce scheduling) onto `queue`
+    // so that `pendingFiles`, `debounceItems`, and `repoRootCache` are only accessed from
+    // a single serial queue, eliminating data races.
+    queue.async {
+        var roots = Set<String>()
+        for path in candidates {
+            guard let root = findRepoRoot(for: path) else { continue }
+            guard let content = readFileContents(path) else { continue }
             if pendingFiles[root] == nil { pendingFiles[root] = [:] }
             pendingFiles[root]![path] = content
+            roots.insert(root)
         }
-        roots.insert(root)
+        for root in roots { scheduleDebounce(repoRoot: root) }
     }
-    for root in roots { scheduleDebounce(repoRoot: root) }
 }
 
 // MARK: - Main
