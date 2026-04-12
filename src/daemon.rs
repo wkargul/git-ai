@@ -665,7 +665,8 @@ fn read_worktree_snapshot_for_files_at_or_before(
             .ok()
             .and_then(|metadata| metadata.modified().ok())
             .and_then(system_time_to_unix_nanos);
-        let modified_after_cutoff = mtime_ns.is_some_and(|modified_ns| modified_ns > max_modified_ns);
+        let modified_after_cutoff =
+            mtime_ns.is_some_and(|modified_ns| modified_ns > max_modified_ns);
         if modified_after_cutoff {
             continue;
         }
@@ -3988,10 +3989,13 @@ impl ActorDaemonCoordinator {
                     let mut sequencers = self.family_sequencers_by_family.lock().map_err(|_| {
                         GitAiError::Generic("family sequencer map lock poisoned".to_string())
                     })?;
-                    let state = sequencers.entry(family.clone()).or_insert_with(|| FamilySequencerState {
-                        next_ordinal: 1,
-                        entries: BTreeMap::new(),
-                    });
+                    let state =
+                        sequencers
+                            .entry(family.clone())
+                            .or_insert_with(|| FamilySequencerState {
+                                next_ordinal: 1,
+                                entries: BTreeMap::new(),
+                            });
                     let order = FamilySequencerOrder {
                         started_at_ns,
                         ordinal: state.next_ordinal,
@@ -5407,10 +5411,7 @@ impl ActorDaemonCoordinator {
     /// The drain worker loop: `notified().await → exec_lock → drain_all_ready_entries`.
     /// This keeps the serial trace-ingest worker free of slow drain I/O; any family's
     /// side-effect pipeline can run without blocking payloads for other families.
-    fn get_or_create_drain_notifier(
-        &self,
-        family: &str,
-    ) -> Result<Arc<Notify>, GitAiError> {
+    fn get_or_create_drain_notifier(&self, family: &str) -> Result<Arc<Notify>, GitAiError> {
         let mut map = self
             .drain_notifiers
             .lock()
@@ -5567,30 +5568,28 @@ impl ActorDaemonCoordinator {
                     // At this point every prior command in this family has already
                     // been drained, so the working log is fully up-to-date.  If the
                     // eager capture found nothing, retry here.
-                    if command.carryover_snapshot_id.is_none() {
-                        if let Some(worktree) = command.worktree.as_deref() {
-                            match self.capture_carryover_snapshot_for_command(
-                                CarryoverCaptureInput {
-                                    root_sid: &command.root_sid,
-                                    worktree,
-                                    primary_command: command.primary_command.as_deref(),
-                                    argv: &command.raw_argv,
-                                    exit_code: command.exit_code,
-                                    finished_at_ns: command.finished_at_ns,
-                                    post_repo: command.post_repo.as_ref(),
-                                    ref_changes: &command.ref_changes,
-                                },
-                            ) {
-                                Ok(Some(snapshot_id)) => {
-                                    command.carryover_snapshot_id = Some(snapshot_id);
-                                }
-                                Ok(None) => {}
-                                Err(e) => {
-                                    debug_log(&format!(
-                                        "deferred carryover snapshot capture failed for sid={}: {}",
-                                        command.root_sid, e
-                                    ));
-                                }
+                    if command.carryover_snapshot_id.is_none()
+                        && let Some(worktree) = command.worktree.as_deref()
+                    {
+                        match self.capture_carryover_snapshot_for_command(CarryoverCaptureInput {
+                            root_sid: &command.root_sid,
+                            worktree,
+                            primary_command: command.primary_command.as_deref(),
+                            argv: &command.raw_argv,
+                            exit_code: command.exit_code,
+                            finished_at_ns: command.finished_at_ns,
+                            post_repo: command.post_repo.as_ref(),
+                            ref_changes: &command.ref_changes,
+                        }) {
+                            Ok(Some(snapshot_id)) => {
+                                command.carryover_snapshot_id = Some(snapshot_id);
+                            }
+                            Ok(None) => {}
+                            Err(e) => {
+                                debug_log(&format!(
+                                    "deferred carryover snapshot capture failed for sid={}: {}",
+                                    command.root_sid, e
+                                ));
                             }
                         }
                     }
