@@ -3787,6 +3787,13 @@ pub struct ActorDaemonCoordinator {
     ingr_root_definitely_read_only: dashmap::DashSet<String>,
     ingr_root_open_connections: dashmap::DashMap<String, usize>,
     ingr_root_close_fallback_enqueued: dashmap::DashSet<String>,
+    /// Root SIDs that have been fully processed (clear_trace_root_tracking was
+    /// called).  Used to discard late/duplicate events (e.g. a connection-close
+    /// fallback atexit that arrives after the root's terminal event) without
+    /// creating a fresh per-root normalizer that would never be cleaned up.
+    /// Bounded to COMPLETED_ROOT_SID_RETENTION_LIMIT entries (FIFO eviction).
+    completed_root_sids: dashmap::DashSet<String>,
+    completed_root_order: Mutex<std::collections::VecDeque<String>>,
     wrapper_states: Mutex<HashMap<String, WrapperStateEntry>>,
     wrapper_state_notify: Notify,
     shutting_down: AtomicBool,
@@ -3806,6 +3813,11 @@ enum TracePayloadApplyOutcome {
     Applied(Box<crate::daemon::domain::AppliedCommand>),
     QueuedFamily,
 }
+
+/// Mirrors `trace_normalizer::COMPLETED_ROOT_RETENTION_LIMIT`: the maximum
+/// number of completed root SIDs kept in `completed_root_sids` to guard
+/// against orphaned normalizers from late duplicate events.
+const COMPLETED_ROOT_SID_RETENTION_LIMIT: usize = 16_384;
 
 impl ActorDaemonCoordinator {
     fn new() -> Self {
@@ -3860,6 +3872,8 @@ impl ActorDaemonCoordinator {
             ingr_root_definitely_read_only: dashmap::DashSet::new(),
             ingr_root_open_connections: dashmap::DashMap::new(),
             ingr_root_close_fallback_enqueued: dashmap::DashSet::new(),
+            completed_root_sids: dashmap::DashSet::new(),
+            completed_root_order: Mutex::new(std::collections::VecDeque::new()),
             wrapper_states: Mutex::new(HashMap::new()),
             wrapper_state_notify: Notify::new(),
             shutting_down: AtomicBool::new(false),
@@ -4319,15 +4333,24 @@ impl ActorDaemonCoordinator {
     fn record_trace_connection_close(&self, roots: &[String]) -> Result<Vec<String>, GitAiError> {
         let mut stale_roots = Vec::new();
         for root_sid in roots {
-            if let Some(mut count) = self.ingr_root_open_connections.get_mut(root_sid) {
-                if *count > 1 {
-                    *count -= 1;
-                    continue;
-                }
-                drop(count);
-                self.ingr_root_open_connections.remove(root_sid);
+            // Atomically decrement the open-connection count and remove the entry
+            // when it hits zero.  remove_if_mut holds the shard write lock for the
+            // entire check-decrement-remove sequence, preventing a TOCTOU race with
+            // trace_root_connection_opened on a concurrent connection-handler thread.
+            //
+            // Return value semantics:
+            //   Some(_) → count decremented to 0, entry removed → root is stale
+            //   None, entry absent  → root was never connection-tracked → stale
+            //   None, entry present → count still > 0 after decrement  → not stale
+            let removed = self
+                .ingr_root_open_connections
+                .remove_if_mut(root_sid, |_, v| {
+                    *v = v.saturating_sub(1);
+                    *v == 0
+                });
+            if removed.is_some() || !self.ingr_root_open_connections.contains_key(root_sid) {
+                stale_roots.push(root_sid.clone());
             }
-            stale_roots.push(root_sid.clone());
         }
         Ok(stale_roots)
     }
@@ -4444,6 +4467,21 @@ impl ActorDaemonCoordinator {
         self.ingr_root_close_fallback_enqueued.remove(root_sid);
         // Release the per-root normalizer once the root is fully processed.
         self.normalizers.remove(root_sid);
+        // Record the root as completed so that any late/duplicate events (e.g.
+        // a connection-close fallback atexit) are discarded in
+        // apply_trace_payload_to_state without creating an orphaned normalizer.
+        {
+            let mut order = self.completed_root_order.lock().map_err(|_| {
+                GitAiError::Generic("completed root order lock poisoned".to_string())
+            })?;
+            if order.len() >= COMPLETED_ROOT_SID_RETENTION_LIMIT
+                && let Some(evicted) = order.pop_front()
+            {
+                self.completed_root_sids.remove(&evicted);
+            }
+            self.completed_root_sids.insert(root_sid.to_string());
+            order.push_back(root_sid.to_string());
+        }
         let mut queued = self.queued_trace_payloads_by_root.lock().map_err(|_| {
             GitAiError::Generic("queued trace payloads by root lock poisoned".to_string())
         })?;
@@ -7031,8 +7069,20 @@ impl ActorDaemonCoordinator {
         &self,
         payload: Value,
     ) -> Result<TracePayloadApplyOutcome, GitAiError> {
-        self.maybe_append_pending_root_from_trace_payload(&payload)?;
+        // Resolve the root SID once up front; reused for both the completed-root
+        // guard and the normalizer lookup below.
         let payload_root_sid = Self::trace_payload_root_sid(&payload);
+        let root_key = payload_root_sid.clone().unwrap_or_default();
+
+        // Early-exit for already-completed roots.  A late atexit (e.g. from a
+        // connection-close fallback) arriving after clear_trace_root_tracking
+        // would otherwise lazily create a fresh empty normalizer that is never
+        // cleaned up, causing an unbounded slow memory leak.
+        if !root_key.is_empty() && self.completed_root_sids.contains(&root_key) {
+            return Ok(TracePayloadApplyOutcome::None);
+        }
+
+        self.maybe_append_pending_root_from_trace_payload(&payload)?;
         let event = payload
             .get("event")
             .and_then(Value::as_str)
@@ -7041,7 +7091,6 @@ impl ActorDaemonCoordinator {
         // Obtain (or lazily create) the per-root normalizer.  We clone the Arc
         // out of the DashMap before awaiting so we don't hold a shard lock
         // across the async suspension point.
-        let root_key = payload_root_sid.clone().unwrap_or_default();
         let normalizer_arc = self
             .normalizers
             .entry(root_key)
@@ -7605,10 +7654,18 @@ fn trace_listener_loop_actor(
             let coord = coordinator.clone();
             if std::thread::Builder::new()
                 .spawn(move || {
+                    // RAII guard: decrements the active-connection counter when
+                    // this scope exits, including on panic-driven unwinding.
+                    struct ActiveGuard(Arc<AtomicUsize>);
+                    impl Drop for ActiveGuard {
+                        fn drop(&mut self) {
+                            self.0.fetch_sub(1, Ordering::Relaxed);
+                        }
+                    }
+                    let _guard = ActiveGuard(active);
                     if let Err(e) = handle_trace_connection_actor(stream, coord) {
                         tracing::debug!(%e, "trace connection error");
                     }
-                    active.fetch_sub(1, Ordering::Relaxed);
                 })
                 .is_err()
             {
