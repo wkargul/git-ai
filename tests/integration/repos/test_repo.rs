@@ -1665,18 +1665,86 @@ impl TestRepo {
         )
     }
 
+    pub(crate) fn daemon_checkpoint_completion_count(&self) -> u64 {
+        let family_key = self.daemon_family_key();
+        self.daemon_completion_entries_for_family(&family_key)
+            .iter()
+            .filter(|entry| entry.primary_command.as_deref() == Some("checkpoint"))
+            .count() as u64
+    }
+
+    pub(crate) fn wait_for_daemon_checkpoint_completion_count(
+        &self,
+        baseline_count: u64,
+        expected_count: u64,
+    ) -> u64 {
+        let family_key = self.daemon_family_key();
+        let start = Instant::now();
+        let mut last_progress = start;
+        let mut last_observed_count = baseline_count;
+        loop {
+            let entries = self.daemon_completion_entries_for_family(&family_key);
+            if let Some(error_entry) = entries
+                .iter()
+                .skip(baseline_count as usize)
+                .find(|entry| entry.status == "error")
+            {
+                panic!(
+                    "daemon completion log reported an error for family {}: {}",
+                    family_key,
+                    error_entry
+                        .error
+                        .as_deref()
+                        .unwrap_or("unknown completion error")
+                );
+            }
+            let observed_count = entries
+                .iter()
+                .filter(|entry| entry.primary_command.as_deref() == Some("checkpoint"))
+                .count() as u64;
+            if observed_count >= expected_count {
+                return observed_count;
+            }
+            if observed_count > last_observed_count {
+                last_progress = Instant::now();
+                last_observed_count = observed_count;
+            }
+            if start.elapsed() >= DAEMON_TEST_SYNC_TOTAL_TIMEOUT
+                || last_progress.elapsed() >= DAEMON_TEST_SYNC_IDLE_TIMEOUT
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        let final_entries = self.daemon_completion_entries_for_family(&family_key);
+        let observed_count = final_entries
+            .iter()
+            .filter(|entry| entry.primary_command.as_deref() == Some("checkpoint"))
+            .count() as u64;
+
+        panic!(
+            "daemon completion log for family {} did not reach {} checkpoint entries within timeout (observed {})",
+            family_key, expected_count, observed_count
+        );
+    }
+
     /// Capture the current daemon completion count before running a `git ai checkpoint`
     /// command so that `sync_queued_checkpoint_if_needed` can wait for it afterward.
+    ///
+    /// The guard is intentionally NOT restricted to `uses_daemon()` modes: in Wrapper
+    /// mode the checkpoint subprocess still delegates to an auto-started daemon with
+    /// `wait=false`, so the drain is async in exactly the same way.
     fn checkpoint_completion_baseline_for_cmd(&self, args: &[&str]) -> u64 {
-        if self.git_mode.uses_daemon() && git_ai_primary_command(args) == Some("checkpoint") {
+        if git_ai_primary_command(args) == Some("checkpoint") {
             self.daemon_total_completion_count()
         } else {
             0
         }
     }
 
-    /// After a successful `git ai checkpoint` in daemon mode, wait for the daemon to
-    /// process it if it was handed off asynchronously.
+    /// After a successful `git ai checkpoint`, wait for the daemon to process it if it
+    /// was handed off asynchronously.
     ///
     /// Captured-async checkpoints delegate to the daemon with `wait=false` and print
     /// "Checkpoint queued" to stderr.  For those we must wait for the completion log to
@@ -1688,10 +1756,11 @@ impl TestRepo {
     ///
     /// Live checkpoints (`wait=true`) print "Checkpoint completed" and their completion
     /// log entry is already written when the subprocess returns, so no waiting is needed.
+    ///
+    /// The `uses_daemon()` guard is intentionally omitted: Wrapper-mode tests that set
+    /// `GIT_AI_DAEMON_CHECKPOINT_DELEGATE=true` also produce async checkpoints that
+    /// require the same synchronisation barrier.
     fn sync_queued_checkpoint_if_needed(&self, args: &[&str], output: &str, baseline: u64) {
-        if !self.git_mode.uses_daemon() {
-            return;
-        }
         if git_ai_primary_command(args) != Some("checkpoint") {
             return;
         }
@@ -1733,7 +1802,7 @@ impl TestRepo {
         Some(common_dir.to_string_lossy().to_string())
     }
 
-    fn daemon_family_key(&self) -> String {
+    pub(crate) fn daemon_family_key(&self) -> String {
         self.daemon_family_key
             .get_or_init(|| self.daemon_family_key_for_repo_path(&self.path))
             .clone()

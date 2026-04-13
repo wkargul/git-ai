@@ -675,6 +675,8 @@ struct WorkdirRaceHarness {
     daemon_home: PathBuf,
     control_socket_path: PathBuf,
     trace_socket_path: PathBuf,
+    /// Family key for the completion log, shared across all worktrees of the repo.
+    daemon_family_key: String,
 }
 
 impl WorkdirRaceHarness {
@@ -685,6 +687,77 @@ impl WorkdirRaceHarness {
             daemon_home: repo.daemon_home_path(),
             control_socket_path: repo.daemon_control_socket_path(),
             trace_socket_path,
+            daemon_family_key: repo.daemon_family_key(),
+        }
+    }
+
+    /// Return the current total number of completion-log entries for this
+    /// harness's git family.  Used to capture a baseline before queuing
+    /// checkpoints so that `wait_for_completion_count` can detect when
+    /// those checkpoints have been fully processed by the drain worker.
+    fn completion_count(&self) -> u64 {
+        let log_path = DaemonConfig::from_home(&self.daemon_home)
+            .test_completion_log_path_for_family(&self.daemon_family_key);
+        let Ok(content) = fs::read_to_string(&log_path) else {
+            return 0;
+        };
+        content
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .count() as u64
+    }
+
+    /// Block until the completion log for this family reaches `expected`
+    /// total entries (or until a 60-second timeout).
+    fn wait_for_completion_count(&self, baseline: u64, expected: u64) {
+        let start = std::time::Instant::now();
+        loop {
+            let count = self.completion_count();
+            if count >= expected {
+                return;
+            }
+            if start.elapsed() >= Duration::from_secs(60) {
+                panic!(
+                    "timeout waiting for {} completions in family {} (observed {}, baseline {})",
+                    expected, self.daemon_family_key, count, baseline
+                );
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Return the current number of checkpoint-specific completion-log entries
+    /// for this harness's git family.
+    fn checkpoint_completion_count(&self) -> u64 {
+        let log_path = DaemonConfig::from_home(&self.daemon_home)
+            .test_completion_log_path_for_family(&self.daemon_family_key);
+        let Ok(content) = fs::read_to_string(&log_path) else {
+            return 0;
+        };
+        content
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter(|v| v.get("primary_command").and_then(|c| c.as_str()) == Some("checkpoint"))
+            .count() as u64
+    }
+
+    /// Block until the checkpoint completion count reaches `expected`
+    /// (or until a 60-second timeout).
+    fn wait_for_checkpoint_completion_count(&self, baseline: u64, expected: u64) {
+        let start = std::time::Instant::now();
+        loop {
+            let count = self.checkpoint_completion_count();
+            if count >= expected {
+                return;
+            }
+            if start.elapsed() >= Duration::from_secs(60) {
+                panic!(
+                    "timeout waiting for {} checkpoint completions in family {} (observed {}, baseline {})",
+                    expected, self.daemon_family_key, count, baseline
+                );
+            }
+            thread::sleep(Duration::from_millis(10));
         }
     }
 
@@ -754,6 +827,8 @@ impl WorkdirRaceHarness {
         line_prefix: &str,
         file_count: usize,
         commit_message: &str,
+        pre_stream_checkpoint_baseline: u64,
+        expected_new_checkpoint_completions: u64,
     ) -> thread::JoinHandle<()> {
         let harness = self.clone();
         let file_prefix = file_prefix.to_string();
@@ -766,6 +841,14 @@ impl WorkdirRaceHarness {
                 let line = format!("{line_prefix}-{idx}");
                 harness.write_ai_line_checkpoint_and_add(&workdir, file.as_str(), line.as_str());
             }
+            // Wait for ALL expected checkpoint completions (across all workers) before
+            // committing.  This prevents the race where the drain processes a checkpoint
+            // AFTER the commit subprocess has already committed the file, causing
+            // resolve_explicit_path_execution to skip the now-clean file.
+            harness.wait_for_checkpoint_completion_count(
+                pre_stream_checkpoint_baseline,
+                pre_stream_checkpoint_baseline + expected_new_checkpoint_completions,
+            );
             harness.run_traced_git(&workdir, &["commit", "-m", commit_message.as_str()]);
         })
     }
@@ -3839,6 +3922,7 @@ fn daemon_pure_trace_socket_concurrent_checkpoint_requests_preserve_exact_line_a
 
     let file_count = 12usize;
     let completion_baseline = repo.daemon_total_completion_count();
+    let checkpoint_baseline = repo.daemon_checkpoint_completion_count();
     let mut expected = Vec::new();
     for idx in 0..file_count {
         let file_rel = format!("daemon-race-concurrent-checkpoint-{idx}.txt");
@@ -3865,6 +3949,14 @@ fn daemon_pure_trace_socket_concurrent_checkpoint_requests_preserve_exact_line_a
 
     repo.git_og_with_env(&["add", "."], &env_refs)
         .expect("staging concurrent checkpoint files should succeed");
+    // Wait for all checkpoints to be drained before committing.  Without this
+    // wait the drain may process a checkpoint AFTER the commit subprocess
+    // finishes, at which point the file is committed/clean and
+    // resolve_explicit_path_execution skips it (status_entry.is_none()).
+    repo.wait_for_daemon_checkpoint_completion_count(
+        checkpoint_baseline,
+        checkpoint_baseline + file_count as u64,
+    );
     repo.git_og_with_env(
         &["commit", "-m", "concurrent delegated checkpoint burst"],
         &env_refs,
@@ -3914,6 +4006,12 @@ fn daemon_pure_trace_socket_parallel_worktree_streams_preserve_exact_line_attrib
 
     let file_count = 8usize;
     let completion_baseline = repo.daemon_total_completion_count();
+    let checkpoint_baseline = repo.daemon_checkpoint_completion_count();
+    // Both workers must wait for ALL 2*file_count checkpoints (from both
+    // workers combined) before either commits.  Using a shared baseline
+    // prevents the race where one worker's commit runs before the other
+    // worker's checkpoints are drained.
+    let expected_new_checkpoint_completions = (file_count as u64) * 2;
 
     let worker_a = harness.spawn_worktree_ai_stream(
         worker_a_dir.clone(),
@@ -3921,6 +4019,8 @@ fn daemon_pure_trace_socket_parallel_worktree_streams_preserve_exact_line_attrib
         "a-parallel-ai-line",
         file_count,
         "parallel worker-a commit",
+        checkpoint_baseline,
+        expected_new_checkpoint_completions,
     );
 
     let worker_b = harness.spawn_worktree_ai_stream(
@@ -3929,6 +4029,8 @@ fn daemon_pure_trace_socket_parallel_worktree_streams_preserve_exact_line_attrib
         "b-parallel-ai-line",
         file_count,
         "parallel worker-b commit",
+        checkpoint_baseline,
+        expected_new_checkpoint_completions,
     );
 
     worker_a
