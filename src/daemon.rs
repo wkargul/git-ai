@@ -3683,7 +3683,10 @@ struct WrapperStateEntry {
 enum TracePayloadApplyOutcome {
     None,
     Applied(Box<crate::daemon::domain::AppliedCommand>),
-    QueuedFamily,
+    /// A command or cancellation was placed in the family sequencer.  The
+    /// contained string is the family key so the ingest worker can run an
+    /// inline drain pass immediately, avoiding scheduling latency.
+    QueuedFamily(String),
 }
 
 impl ActorDaemonCoordinator {
@@ -5436,14 +5439,6 @@ impl ActorDaemonCoordinator {
         let notifier_clone = notifier.clone();
         tokio::spawn(async move {
             loop {
-                // Create the `Notified` future BEFORE acquiring the exec-lock and
-                // draining, so that any `notify_one()` fired *during* the drain is
-                // captured as a pending wakeup rather than lost.  Tokio's `Notify`
-                // stores at most one permit: calling `notify_one()` while no future
-                // is registered stores the permit; the subsequent `notified.await`
-                // at the bottom of the loop will see it and return immediately,
-                // triggering another drain pass instead of sleeping indefinitely.
-                let notified = notifier_clone.notified();
                 if coordinator.is_shutting_down() {
                     break;
                 }
@@ -5451,23 +5446,35 @@ impl ActorDaemonCoordinator {
                     Ok(lock) => lock,
                     Err(_) => break,
                 };
-                let _guard = exec_lock.lock().await;
+                // Hold exec_lock ONLY for the drain pass — release it BEFORE waiting
+                // for the next notification.  Keeping exec_lock held across
+                // `notified.await` would prevent the trace-ingest worker from
+                // acquiring it for its own inline drain passes (see
+                // `ingest_trace_payload_fast`), stalling checkpoint processing.
+                {
+                    let _guard = exec_lock.lock().await;
+                    if coordinator.is_shutting_down() {
+                        break;
+                    }
+                    if let Err(e) = coordinator
+                        .drain_ready_family_sequencer_entries_locked(&family_clone)
+                        .await
+                    {
+                        debug_log(&format!(
+                            "drain worker error for family {}: {}",
+                            family_clone, e
+                        ));
+                    }
+                    // _guard drops here, releasing exec_lock before notified.await
+                }
                 if coordinator.is_shutting_down() {
                     break;
                 }
-                if let Err(e) = coordinator
-                    .drain_ready_family_sequencer_entries_locked(&family_clone)
-                    .await
-                {
-                    debug_log(&format!(
-                        "drain worker error for family {}: {}",
-                        family_clone, e
-                    ));
-                }
-                // Wait for the next notification now that the drain pass is complete.
-                // Any `notify_one()` that fired during the drain will have stored a
-                // permit, so this await will return immediately in that case.
-                notified.await;
+                // Wait for the next notification WITHOUT holding exec_lock.
+                // Any notify_one() fired during the drain stored a Tokio permit;
+                // notified().await sees it immediately and triggers another drain
+                // pass rather than sleeping indefinitely.
+                notifier_clone.notified().await;
             }
         });
 
@@ -7029,8 +7036,7 @@ impl ActorDaemonCoordinator {
                     .await?
             {
                 self.clear_trace_root_tracking(root_sid)?;
-                let _ = family;
-                return Ok(TracePayloadApplyOutcome::QueuedFamily);
+                return Ok(TracePayloadApplyOutcome::QueuedFamily(family));
             }
             return Ok(TracePayloadApplyOutcome::None);
         };
@@ -7043,8 +7049,7 @@ impl ActorDaemonCoordinator {
             )
             .await?
         {
-            let _ = family;
-            TracePayloadApplyOutcome::QueuedFamily
+            TracePayloadApplyOutcome::QueuedFamily(family)
         } else {
             match self.coordinator.route_command(command).await {
                 Ok(applied) => TracePayloadApplyOutcome::Applied(Box::new(applied)),
@@ -7064,7 +7069,29 @@ impl ActorDaemonCoordinator {
             return Ok(());
         }
         match self.apply_trace_payload_to_state(payload).await? {
-            TracePayloadApplyOutcome::None | TracePayloadApplyOutcome::QueuedFamily => {}
+            TracePayloadApplyOutcome::None => {}
+            TracePayloadApplyOutcome::QueuedFamily(family) => {
+                // Run an inline drain pass immediately rather than waiting for
+                // the per-family drain worker task to be scheduled by Tokio.
+                // Under CI load the scheduling latency can exceed the test-sync
+                // idle timeout, causing "session never observed" failures.  The
+                // exec_lock serialises this inline drain with any concurrent
+                // drain worker run (one will drain, the other sees an empty
+                // sequencer and is a no-op).  The drain worker remains in place
+                // as a backup for checkpoints and any notifications it receives
+                // while this ingest worker is processing other events.
+                let exec_lock = self.side_effect_exec_lock(&family)?;
+                let _guard = exec_lock.lock().await;
+                if let Err(e) = self
+                    .drain_ready_family_sequencer_entries_locked(&family)
+                    .await
+                {
+                    debug_log(&format!(
+                        "daemon inline drain error for family {}: {}",
+                        family, e
+                    ));
+                }
+            }
             TracePayloadApplyOutcome::Applied(mut applied) => {
                 if let Some(family) = applied.command.family_key.as_ref().map(|key| key.0.clone()) {
                     self.begin_family_effect(&family)?;
