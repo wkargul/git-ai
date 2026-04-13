@@ -5605,7 +5605,14 @@ impl ActorDaemonCoordinator {
                     // does not kill the daemon process.
                     let side_effect_result = {
                         let future = async {
-                            let applied = self.coordinator.route_command(*command).await?;
+                            let mut applied = self.coordinator.route_command(*command).await?;
+                            // For wrapper-daemon mode: wait for and apply wrapper pre/post
+                            // repo context, just as the Applied path does (line ~7098).
+                            // Without this, sequenced commands (those that go through
+                            // the family sequencer) never receive wrapper state overlay.
+                            if applied.command.wrapper_invocation_id.is_some() {
+                                self.apply_wrapper_state_overlay(&mut applied.command).await;
+                            }
                             let side_effect = self
                                 .maybe_apply_side_effects_for_applied_command(
                                     Some(family),
