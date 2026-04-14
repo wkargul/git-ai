@@ -969,24 +969,22 @@ fn is_executable(path: &Path) -> bool {
     true
 }
 
-/// Detect if a path is actually the git-ai binary (or a symlink to it).
-/// This prevents `git_cmd()` from returning the git-ai shim, which would
-/// cause infinite recursion: handle_git() → proxy_to_git() → shim → handle_git() → ...
+/// Detect if a path is actually the git-ai binary (or a symlink/hardlink/copy
+/// of it).  This prevents `git_cmd()` from returning the git-ai shim, which
+/// would cause infinite recursion:
+///   handle_git() → proxy_to_git() → shim → handle_git() → …
 fn path_is_git_ai_binary(path: &Path) -> bool {
-    // Check if a sibling "git-ai" exists in the same directory — this is the
-    // telltale sign that `path` is the git shim installed next to git-ai.
-    if let Some(parent) = path.parent() {
-        let git_ai_name = if cfg!(windows) {
-            "git-ai.exe"
-        } else {
-            "git-ai"
-        };
-        if parent.join(git_ai_name).exists() {
-            return true;
-        }
-    }
+    path_is_git_ai_binary_impl(path, std::env::current_exe().ok().as_deref())
+}
 
-    // Also check canonical path — the symlink target may be git-ai itself.
+/// Inner implementation that accepts an explicit `self_exe` so unit tests can
+/// supply it without relying on the real `current_exe()` (which would be the
+/// test-runner binary).
+fn path_is_git_ai_binary_impl(path: &Path, self_exe: Option<&Path>) -> bool {
+    // 1) Canonical-name check — if the path ultimately resolves to a file
+    //    named "git-ai" (or a variant like "git-ai-linux-x64"), it is
+    //    git-ai regardless of the original symlink name.
+    //    Catches: `git → git-ai` symlinks (the standard Unix shim).
     if let Ok(canonical) = path.canonicalize()
         && let Some(name) = canonical.file_name().and_then(|n| n.to_str())
     {
@@ -996,7 +994,71 @@ fn path_is_git_ai_binary(path: &Path) -> bool {
         }
     }
 
+    // 2) Compare against the currently-running binary.  Since *we* are
+    //    git-ai, any candidate that is the same file (symlink / hardlink)
+    //    or the same content (copy — the Windows installer uses Copy-Item)
+    //    is git-ai and must be rejected.
+    //    This avoids the false positive of the old sibling-existence
+    //    heuristic, which rejected a real `/usr/local/bin/git` simply
+    //    because `/usr/local/bin/git-ai` existed alongside it (e.g. Docker
+    //    images that compile git from source and symlink git-ai into the
+    //    same prefix).
+    if let Some(self_path) = self_exe
+        && is_same_binary(path, self_path)
+    {
+        return true;
+    }
+
     false
+}
+
+/// Check whether two paths refer to the same underlying file.
+/// On Unix this compares (dev, ino); on other platforms it falls back to
+/// comparing canonicalized paths.
+fn same_file(a: &Path, b: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if let (Ok(ma), Ok(mb)) = (fs::metadata(a), fs::metadata(b)) {
+            return ma.dev() == mb.dev() && ma.ino() == mb.ino();
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        if let (Ok(ca), Ok(cb)) = (a.canonicalize(), b.canonicalize()) {
+            return ca == cb;
+        }
+    }
+    false
+}
+
+/// Returns true when `candidate` is the same binary as `reference`:
+///  - same file on disk (symlink / hardlink / bind-mount), OR
+///  - identical content (copy — the Windows installer creates copies
+///    because symlinks require admin privileges).
+///
+/// A fast size check avoids reading file content when the lengths differ.
+fn is_same_binary(candidate: &Path, reference: &Path) -> bool {
+    // Fast path: same underlying file.
+    if same_file(candidate, reference) {
+        return true;
+    }
+
+    // Slow path: content comparison (catches copies).
+    // Short-circuit on different file sizes — almost always sufficient to
+    // distinguish git (~3 MB) from git-ai, except in the shim-copy case
+    // where sizes are identical by definition.
+    let (meta_c, meta_r) = match (fs::metadata(candidate), fs::metadata(reference)) {
+        (Ok(a), Ok(b)) => (a, b),
+        _ => return false,
+    };
+    if meta_c.len() != meta_r.len() {
+        return false;
+    }
+    match (fs::read(candidate), fs::read(reference)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
 }
 
 /// Returns true if `p` is an executable git binary that is NOT git-ai.
@@ -1627,5 +1689,88 @@ mod tests {
 
         let parsed = parse_file_config_bytes(data).expect("regular config should parse");
         assert_eq!(parsed.git_path.as_deref(), Some("/usr/bin/git"));
+    }
+
+    // ---------------------------------------------------------------
+    // path_is_git_ai_binary / fork-bomb prevention tests
+    // ---------------------------------------------------------------
+    // These exercise the testable `path_is_git_ai_binary_impl` so we
+    // can supply a fake "self exe" instead of the real test-runner.
+
+    #[test]
+    #[cfg(unix)]
+    fn test_git_ai_binary_detected_via_symlink_name() {
+        // `git → git-ai` — canonical name resolves to "git-ai".
+        let dir = tempfile::tempdir().unwrap();
+        let git_ai = dir.path().join("git-ai");
+        fs::write(&git_ai, "binary-content").unwrap();
+        let git = dir.path().join("git");
+        std::os::unix::fs::symlink(&git_ai, &git).unwrap();
+
+        // Detected even without self_exe (canonical-name check alone).
+        assert!(path_is_git_ai_binary_impl(&git, None));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_git_ai_binary_detected_via_hardlink() {
+        // Hardlink: different name, same inode — caught by self_exe comparison.
+        let dir = tempfile::tempdir().unwrap();
+        let git_ai = dir.path().join("git-ai");
+        fs::write(&git_ai, "binary-content").unwrap();
+        let git = dir.path().join("git");
+        fs::hard_link(&git_ai, &git).unwrap();
+
+        assert!(path_is_git_ai_binary_impl(&git, Some(&git_ai)));
+    }
+
+    #[test]
+    fn test_git_ai_binary_detected_via_copy() {
+        // Copy: different file, same content — the Windows installer case.
+        let dir = tempfile::tempdir().unwrap();
+        let git_ai = dir.path().join("git-ai");
+        fs::write(&git_ai, "identical-binary-content").unwrap();
+        let git = dir.path().join("git");
+        fs::write(&git, "identical-binary-content").unwrap();
+
+        assert!(path_is_git_ai_binary_impl(&git, Some(&git_ai)));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_real_git_not_flagged_with_sibling_git_ai_symlink() {
+        // Docker/server case: real compiled git + git-ai symlink in same dir.
+        let dir = tempfile::tempdir().unwrap();
+        let real_git = dir.path().join("git");
+        fs::write(&real_git, "real-git-binary").unwrap();
+        // git-ai is a different file entirely.
+        let git_ai_target = dir.path().join("git-ai-actual");
+        fs::write(&git_ai_target, "git-ai-binary").unwrap();
+        std::os::unix::fs::symlink(&git_ai_target, dir.path().join("git-ai")).unwrap();
+
+        assert!(!path_is_git_ai_binary_impl(&real_git, Some(&git_ai_target)));
+    }
+
+    #[test]
+    fn test_real_git_not_flagged_when_self_exe_differs() {
+        // Generic case: candidate is a completely different binary.
+        let dir = tempfile::tempdir().unwrap();
+        let real_git = dir.path().join("git");
+        fs::write(&real_git, "real-git-binary-contents").unwrap();
+        let self_exe = dir.path().join("git-ai");
+        fs::write(&self_exe, "git-ai-binary-contents").unwrap();
+
+        assert!(!path_is_git_ai_binary_impl(&real_git, Some(&self_exe)));
+    }
+
+    #[test]
+    fn test_graceful_when_self_exe_unavailable() {
+        // If current_exe() fails (self_exe=None), we still detect symlinks
+        // but do not reject a real git binary.
+        let dir = tempfile::tempdir().unwrap();
+        let real_git = dir.path().join("git");
+        fs::write(&real_git, "real-git-binary").unwrap();
+
+        assert!(!path_is_git_ai_binary_impl(&real_git, None));
     }
 }
