@@ -7168,159 +7168,174 @@ impl ActorDaemonCoordinator {
             }
             TracePayloadApplyOutcome::Applied(mut applied) => {
                 if let Some(family) = applied.command.family_key.as_ref().map(|key| key.0.clone()) {
-                    // Save fallback test-sync metadata before processing so we can
-                    // write a completion log entry even when side effects fail or
-                    // panic — mirroring the drain path's robust error handling.
-                    let fallback_test_sync_session =
-                        crate::daemon::test_sync::test_sync_session_from_invocation(
-                            &parsed_invocation_for_normalized_command(&applied.command),
-                        );
-                    let fallback_sync_tracked =
-                        crate::daemon::test_sync::tracks_primary_command_for_test_sync(
-                            applied.command.primary_command.as_deref(),
-                            &applied.command.invoked_args,
-                        );
-                    let fallback_primary_command = applied.command.primary_command.clone();
-                    let fallback_exit_code = applied.command.exit_code;
-
-                    // Always spawn a dedicated task for Applied-path side effects
-                    // rather than running inline in the ingest worker.  Inline
-                    // processing (even with try_lock) blocks the single-threaded
-                    // ingest worker for the duration of blame computation and note
-                    // writing, starving ALL other families' trace event processing
-                    // and causing idle-timeout failures in unrelated tests.
+                    let exec_lock = self.side_effect_exec_lock(&family)?;
+                    // Use try_lock for the common fast path: when exec_lock is
+                    // available, process inline to avoid scheduling latency and
+                    // ensure the completion log entry is written before the
+                    // ingest worker moves on.  Applied-path commands (add, diff,
+                    // status, push) have fast side effects — they never run
+                    // blame computation — so inline processing does not block
+                    // the ingest worker for problematic durations.
                     //
-                    // The spawned task acquires exec_lock to serialise with any
-                    // concurrent drain or checkpoint processing for this family.
-                    let coordinator = self.clone();
-                    let family_clone = family.clone();
-                    let fb_session = fallback_test_sync_session;
-                    let fb_tracked = fallback_sync_tracked;
-                    let fb_primary = fallback_primary_command;
-                    let fb_exit = fallback_exit_code;
-                    let seq = applied.seq;
-                    tokio::spawn(async move {
-                        let side_effect_result = {
-                            let future = async {
-                                let lock = coordinator.side_effect_exec_lock(&family_clone)?;
-                                let _guard = lock.lock().await;
-                                coordinator.begin_family_effect(&family_clone)?;
-                                if applied.command.wrapper_invocation_id.is_some() {
-                                    // Use a short timeout: Applied-path commands are
-                                    // non-sequencer (add, diff, status, etc.).  Inner
-                                    // git processes inherit GIT_AI_WRAPPER_INVOCATION_ID
-                                    // but the wrapper never sends them post-state, so
-                                    // they must time out quickly rather than holding
-                                    // exec_lock for the full 20s default, which would
-                                    // block the drain worker from processing sequenced
-                                    // commands (commit, rebase, etc.) for this family.
-                                    coordinator
-                                        .apply_wrapper_state_overlay_with_timeout(
-                                            &mut applied.command,
-                                            Duration::from_millis(200),
+                    // When try_lock fails (another family operation holds
+                    // exec_lock), spawn a task to avoid blocking the ingest
+                    // worker.  This is rare in practice because Applied commands
+                    // complete quickly.
+                    if let Ok(guard) = exec_lock.try_lock() {
+                        self.begin_family_effect(&family)?;
+                        if applied.command.wrapper_invocation_id.is_some() {
+                            self.apply_wrapper_state_overlay_with_timeout(
+                                &mut applied.command,
+                                Duration::from_millis(200),
+                            )
+                            .await;
+                        }
+                        let result = self
+                            .maybe_apply_side_effects_for_applied_command(Some(&family), &applied)
+                            .await;
+                        let _ = self.end_family_effect(&family);
+                        if let Err(error) = &result {
+                            let _ = self.record_side_effect_error(&family, applied.seq, error);
+                        }
+                        if let Err(error) = self.append_command_completion_log(
+                            &family,
+                            &applied,
+                            &result,
+                            applied.seq,
+                        ) {
+                            let _ = self.record_side_effect_error(&family, applied.seq, &error);
+                        }
+                        drop(guard);
+                    } else {
+                        // exec_lock is held — spawn so the ingest worker is not
+                        // blocked.  Save fallback test-sync metadata for robust
+                        // completion logging on error/panic.
+                        let fallback_test_sync_session =
+                            crate::daemon::test_sync::test_sync_session_from_invocation(
+                                &parsed_invocation_for_normalized_command(&applied.command),
+                            );
+                        let fallback_sync_tracked =
+                            crate::daemon::test_sync::tracks_primary_command_for_test_sync(
+                                applied.command.primary_command.as_deref(),
+                                &applied.command.invoked_args,
+                            );
+                        let fallback_primary_command = applied.command.primary_command.clone();
+                        let fallback_exit_code = applied.command.exit_code;
+                        let coordinator = self.clone();
+                        let family_clone = family.clone();
+                        let fb_session = fallback_test_sync_session;
+                        let fb_tracked = fallback_sync_tracked;
+                        let fb_primary = fallback_primary_command;
+                        let fb_exit = fallback_exit_code;
+                        let seq = applied.seq;
+                        tokio::spawn(async move {
+                            let side_effect_result = {
+                                let future = async {
+                                    let lock = coordinator.side_effect_exec_lock(&family_clone)?;
+                                    let _guard = lock.lock().await;
+                                    coordinator.begin_family_effect(&family_clone)?;
+                                    if applied.command.wrapper_invocation_id.is_some() {
+                                        coordinator
+                                            .apply_wrapper_state_overlay_with_timeout(
+                                                &mut applied.command,
+                                                Duration::from_millis(200),
+                                            )
+                                            .await;
+                                    }
+                                    let result = coordinator
+                                        .maybe_apply_side_effects_for_applied_command(
+                                            Some(&family_clone),
+                                            &applied,
                                         )
                                         .await;
-                                }
-                                let result = coordinator
-                                    .maybe_apply_side_effects_for_applied_command(
-                                        Some(&family_clone),
-                                        &applied,
-                                    )
-                                    .await;
-                                let _ = coordinator.end_family_effect(&family_clone);
-                                Ok::<_, GitAiError>((applied, result))
+                                    let _ = coordinator.end_family_effect(&family_clone);
+                                    Ok::<_, GitAiError>((applied, result))
+                                };
+                                let caught = std::panic::AssertUnwindSafe(future);
+                                futures::FutureExt::catch_unwind(caught).await
                             };
-                            let caught = std::panic::AssertUnwindSafe(future);
-                            futures::FutureExt::catch_unwind(caught).await
-                        };
-                        match side_effect_result {
-                            Ok(Ok((applied, result))) => {
-                                if let Err(error) = &result {
-                                    let _ = coordinator.record_side_effect_error(
+                            match side_effect_result {
+                                Ok(Ok((applied, result))) => {
+                                    if let Err(error) = &result {
+                                        let _ = coordinator.record_side_effect_error(
+                                            &family_clone,
+                                            seq,
+                                            error,
+                                        );
+                                    }
+                                    if let Err(error) = coordinator.append_command_completion_log(
                                         &family_clone,
+                                        &applied,
+                                        &result,
                                         seq,
-                                        error,
-                                    );
-                                    debug_log(&format!(
-                                        "daemon applied-path side-effect error for family {} seq {}: {}",
-                                        family_clone, seq, error
-                                    ));
+                                    ) {
+                                        let _ = coordinator.record_side_effect_error(
+                                            &family_clone,
+                                            seq,
+                                            &error,
+                                        );
+                                    }
                                 }
-                                if let Err(error) = coordinator.append_command_completion_log(
-                                    &family_clone,
-                                    &applied,
-                                    &result,
-                                    seq,
-                                ) {
+                                Ok(Err(error)) => {
                                     let _ = coordinator.record_side_effect_error(
                                         &family_clone,
                                         seq,
                                         &error,
                                     );
+                                    let log_entry = TestCompletionLogEntry {
+                                        seq: 0,
+                                        family_key: family_clone.clone(),
+                                        kind: "command".to_string(),
+                                        primary_command: fb_primary.clone(),
+                                        test_sync_session: fb_session.clone(),
+                                        exit_code: Some(fb_exit),
+                                        sync_tracked: fb_tracked,
+                                        status: "error".to_string(),
+                                        error: Some(error.to_string()),
+                                    };
+                                    let _ = coordinator.maybe_append_test_completion_log(
+                                        &family_clone,
+                                        &log_entry,
+                                    );
                                 }
-                            }
-                            Ok(Err(error)) => {
-                                let _ = coordinator.record_side_effect_error(
-                                    &family_clone,
-                                    seq,
-                                    &error,
-                                );
-                                debug_log(&format!(
-                                    "daemon applied-path error for family {} seq {}: {}",
-                                    family_clone, seq, error
-                                ));
-                                let log_entry = TestCompletionLogEntry {
-                                    seq: 0,
-                                    family_key: family_clone.clone(),
-                                    kind: "command".to_string(),
-                                    primary_command: fb_primary.clone(),
-                                    test_sync_session: fb_session.clone(),
-                                    exit_code: Some(fb_exit),
-                                    sync_tracked: fb_tracked,
-                                    status: "error".to_string(),
-                                    error: Some(error.to_string()),
-                                };
-                                let _ = coordinator
-                                    .maybe_append_test_completion_log(&family_clone, &log_entry);
-                            }
-                            Err(panic_payload) => {
-                                let panic_msg =
-                                    if let Some(s) = panic_payload.downcast_ref::<String>() {
+                                Err(panic_payload) => {
+                                    let panic_msg = if let Some(s) =
+                                        panic_payload.downcast_ref::<String>()
+                                    {
                                         s.clone()
                                     } else if let Some(s) = panic_payload.downcast_ref::<&str>() {
                                         s.to_string()
                                     } else {
                                         "unknown panic".to_string()
                                     };
-                                let error = GitAiError::Generic(format!(
-                                    "daemon applied-path panic: {}",
-                                    panic_msg
-                                ));
-                                let _ = coordinator.record_side_effect_error(
-                                    &family_clone,
-                                    seq,
-                                    &error,
-                                );
-                                debug_log(&format!(
-                                    "daemon applied-path panic for family {} seq {}: {}",
-                                    family_clone, seq, panic_msg
-                                ));
-                                let log_entry = TestCompletionLogEntry {
-                                    seq: 0,
-                                    family_key: family_clone.clone(),
-                                    kind: "command".to_string(),
-                                    primary_command: fb_primary,
-                                    test_sync_session: fb_session,
-                                    exit_code: Some(fb_exit),
-                                    sync_tracked: fb_tracked,
-                                    status: "error".to_string(),
-                                    error: Some(panic_msg),
-                                };
-                                let _ = coordinator
-                                    .maybe_append_test_completion_log(&family_clone, &log_entry);
+                                    let error = GitAiError::Generic(format!(
+                                        "daemon applied-path panic: {}",
+                                        panic_msg
+                                    ));
+                                    let _ = coordinator.record_side_effect_error(
+                                        &family_clone,
+                                        seq,
+                                        &error,
+                                    );
+                                    let log_entry = TestCompletionLogEntry {
+                                        seq: 0,
+                                        family_key: family_clone.clone(),
+                                        kind: "command".to_string(),
+                                        primary_command: fb_primary,
+                                        test_sync_session: fb_session,
+                                        exit_code: Some(fb_exit),
+                                        sync_tracked: fb_tracked,
+                                        status: "error".to_string(),
+                                        error: Some(panic_msg),
+                                    };
+                                    let _ = coordinator.maybe_append_test_completion_log(
+                                        &family_clone,
+                                        &log_entry,
+                                    );
+                                }
                             }
-                        }
-                    });
+                        });
+                    }
                 }
             }
         }
