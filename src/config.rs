@@ -975,13 +975,17 @@ fn is_executable(path: &Path) -> bool {
 fn path_is_git_ai_binary(path: &Path) -> bool {
     // Check if a sibling "git-ai" exists in the same directory — this is the
     // telltale sign that `path` is the git shim installed next to git-ai.
+    // Exception: /usr/local/bin/git is the standard system git location and
+    // must not be rejected just because git-ai is also symlinked there (e.g.
+    // Docker images that compile git from source and symlink git-ai into the
+    // same prefix).
     if let Some(parent) = path.parent() {
         let git_ai_name = if cfg!(windows) {
             "git-ai.exe"
         } else {
             "git-ai"
         };
-        if parent.join(git_ai_name).exists() {
+        if parent.join(git_ai_name).exists() && path != Path::new("/usr/local/bin/git") {
             return true;
         }
     }
