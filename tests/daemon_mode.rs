@@ -4639,7 +4639,12 @@ fn daemon_wrapper_daemon_rebase_preserves_ai_notes() {
     // Create feature branch with AI-attributed commit
     repo.git(&["checkout", "-b", "feature"]).unwrap();
     let mut ai_file = repo.filename("ai_feature.txt");
-    ai_file.set_contents(lines!["// AI generated code".ai(), "function compute() {".ai(), "  return 42;".ai(), "}".ai()]);
+    ai_file.set_contents(lines![
+        "// AI generated code".ai(),
+        "function compute() {".ai(),
+        "  return 42;".ai(),
+        "}".ai()
+    ]);
     repo.stage_all_and_commit("AI feature commit").unwrap();
 
     // Advance default branch to force a non-trivial rebase
@@ -4835,15 +4840,13 @@ fn daemon_wrapper_daemon_rebase_continue_preserves_ai_notes() {
     // Main branch: modify same shared file to cause conflict
     repo.git(&["checkout", &default_branch]).unwrap();
     shared_file.set_contents(lines!["main content"]);
-    repo.stage_all_and_commit("Main conflicting commit").unwrap();
+    repo.stage_all_and_commit("Main conflicting commit")
+        .unwrap();
 
     // Start rebase — this will fail due to conflict
     repo.git(&["checkout", "feature"]).unwrap();
     let rebase_result = repo.git(&["rebase", &default_branch]);
-    assert!(
-        rebase_result.is_err(),
-        "rebase should fail due to conflict"
-    );
+    assert!(rebase_result.is_err(), "rebase should fail due to conflict");
 
     // Resolve conflict by accepting feature's version
     shared_file.set_contents(lines!["resolved content".ai()]);

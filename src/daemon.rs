@@ -6220,73 +6220,62 @@ impl ActorDaemonCoordinator {
                     })?;
                     let repository = repository_for_rewrite_context(cmd, "rebase_complete")?;
                     let start_target_hint = rebase_start_target_hint_from_command(cmd);
-                    let (mapping_old_head, stable_new_head, onto_head) =
-                        if let Some(heads) = Self::stable_rebase_heads_from_worktree(
+                    let (mapping_old_head, stable_new_head, onto_head) = if let Some(heads) =
+                        Self::stable_rebase_heads_from_worktree(
                             &repository,
                             worktree,
                             &cmd.raw_argv,
                             start_target_hint.as_deref(),
                         )? {
-                            heads
-                        } else {
-                            // Fallback: stable reflog segment not found.  Use the
-                            // semantic event heads (from ref_changes / pre/post_repo)
-                            // combined with the pending rebase original head if
-                            // available.  This prevents silent note loss when the
-                            // HEAD reflog segment parsing fails (fixes #1079).
-                            let pending_old = self
-                                .pending_rebase_original_head_for_worktree(worktree)
-                                .ok()
-                                .flatten();
-                            let fallback_old = pending_old
-                                .as_deref()
-                                .filter(|s| !s.is_empty())
-                                .or_else(|| {
-                                    if !old_head.is_empty() {
-                                        Some(old_head.as_str())
-                                    } else {
-                                        None
-                                    }
-                                });
-                            let fallback_new = if !new_head.is_empty() {
-                                Some(new_head.as_str())
-                            } else {
-                                cmd.post_repo
-                                    .as_ref()
-                                    .and_then(|repo| repo.head.as_deref())
-                            };
-                            if let (Some(fallback_old), Some(fallback_new)) =
-                                (fallback_old, fallback_new)
-                            {
-                                debug_log(&format!(
-                                    "rebase complete using fallback heads (no stable reflog segment) old={} new={} sid={}",
-                                    fallback_old, fallback_new, cmd.root_sid
-                                ));
-                                // Use merge-base as onto_head approximation
-                                let onto = repository
-                                    .merge_base(
-                                        fallback_old.to_string(),
-                                        fallback_new.to_string(),
-                                    )
-                                    .unwrap_or_else(|_| fallback_new.to_string());
-                                (
-                                    fallback_old.to_string(),
-                                    fallback_new.to_string(),
-                                    onto,
-                                )
-                            } else {
-                                debug_log(&format!(
-                                    "rebase complete produced no unprocessed replay segment and no fallback heads; skipping rewrite synthesis sid={}",
-                                    cmd.root_sid
-                                ));
-                                if let Some(worktree) = cmd.worktree.as_ref() {
-                                    self.clear_pending_rebase_original_head_for_worktree(
-                                        worktree,
-                                    )?;
+                        heads
+                    } else {
+                        // Fallback: stable reflog segment not found.  Use the
+                        // semantic event heads (from ref_changes / pre/post_repo)
+                        // combined with the pending rebase original head if
+                        // available.  This prevents silent note loss when the
+                        // HEAD reflog segment parsing fails (fixes #1079).
+                        let pending_old = self
+                            .pending_rebase_original_head_for_worktree(worktree)
+                            .ok()
+                            .flatten();
+                        let fallback_old = pending_old
+                            .as_deref()
+                            .filter(|s| !s.is_empty())
+                            .or_else(|| {
+                                if !old_head.is_empty() {
+                                    Some(old_head.as_str())
+                                } else {
+                                    None
                                 }
-                                continue;
-                            }
+                            });
+                        let fallback_new = if !new_head.is_empty() {
+                            Some(new_head.as_str())
+                        } else {
+                            cmd.post_repo.as_ref().and_then(|repo| repo.head.as_deref())
                         };
+                        if let (Some(fallback_old), Some(fallback_new)) =
+                            (fallback_old, fallback_new)
+                        {
+                            debug_log(&format!(
+                                "rebase complete using fallback heads (no stable reflog segment) old={} new={} sid={}",
+                                fallback_old, fallback_new, cmd.root_sid
+                            ));
+                            // Use merge-base as onto_head approximation
+                            let onto = repository
+                                .merge_base(fallback_old.to_string(), fallback_new.to_string())
+                                .unwrap_or_else(|_| fallback_new.to_string());
+                            (fallback_old.to_string(), fallback_new.to_string(), onto)
+                        } else {
+                            debug_log(&format!(
+                                "rebase complete produced no unprocessed replay segment and no fallback heads; skipping rewrite synthesis sid={}",
+                                cmd.root_sid
+                            ));
+                            if let Some(worktree) = cmd.worktree.as_ref() {
+                                self.clear_pending_rebase_original_head_for_worktree(worktree)?;
+                            }
+                            continue;
+                        }
+                    };
                     if (!old_head.is_empty() && old_head != &mapping_old_head)
                         || (!new_head.is_empty() && new_head != &stable_new_head)
                     {
