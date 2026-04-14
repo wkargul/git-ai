@@ -1804,52 +1804,6 @@ impl TestRepo {
         self.wait_for_daemon_checkpoint_completion_count(baseline, baseline.saturating_add(1));
     }
 
-    /// Like `checkpoint_completion_baseline_for_cmd`, but derives the family key
-    /// from an arbitrary repo path instead of `self.path`.  Used by
-    /// `git_ai_from_working_dir` where the checkpoint target repo differs from
-    /// the test repo.
-    fn checkpoint_completion_baseline_for_path(
-        &self,
-        args: &[&str],
-        repo_path: &Path,
-    ) -> u64 {
-        if git_ai_primary_command(args) != Some("checkpoint") {
-            return 0;
-        }
-        let Some(family_key) = self.maybe_daemon_family_key_for_repo_path(repo_path) else {
-            return 0;
-        };
-        self.daemon_completion_entries_for_family(&family_key)
-            .iter()
-            .filter(|entry| entry.primary_command.as_deref() == Some("checkpoint"))
-            .count() as u64
-    }
-
-    /// Like `sync_queued_checkpoint_if_needed`, but waits on the completion log
-    /// for the repo at `repo_path` rather than `self.path`.
-    fn sync_queued_checkpoint_for_path(
-        &self,
-        args: &[&str],
-        output: &str,
-        baseline: u64,
-        repo_path: &Path,
-    ) {
-        if git_ai_primary_command(args) != Some("checkpoint") {
-            return;
-        }
-        if !output.contains("queued") {
-            return;
-        }
-        let Some(family_key) = self.maybe_daemon_family_key_for_repo_path(repo_path) else {
-            return;
-        };
-        self.wait_for_daemon_checkpoint_completion_count_in_family(
-            &family_key,
-            baseline,
-            baseline.saturating_add(1),
-        );
-    }
-
     fn daemon_family_key_for_repo_path(&self, repo_path: &Path) -> String {
         let repo = GitAiRepository::find_repository_in_path(repo_path.to_str().unwrap())
             .unwrap_or_else(|e| {
@@ -2504,22 +2458,41 @@ impl TestRepo {
                 e
             )
         })?;
-
-        // Capture checkpoint baseline BEFORE running the command.  The working
-        // dir may belong to a different repo than self (cross-repo tests), so
-        // we derive the family key from the actual working directory.
-        let checkpoint_baseline =
-            self.checkpoint_completion_baseline_for_path(args, &absolute_working_dir);
-
         command
             .args(&normalized_args)
             .current_dir(&absolute_working_dir);
         self.configure_git_ai_env(&mut command);
 
-        if let Some(patch) = &self.config_patch
-            && let Ok(patch_json) = serde_json::to_string(patch)
+        // Disable async checkpoint delegation for cross-repo commands.
+        // The working directory belongs to a different repo than the test
+        // repo, so the daemon's completion log is written under the
+        // working dir's family key — which the test sync infrastructure
+        // cannot reliably wait on.  Unsetting the delegation env var and
+        // overriding async_mode=false causes the checkpoint to run locally
+        // in the subprocess — the same product code path used when daemon
+        // checkpoint delegation is not configured.
+        command.env_remove("GIT_AI_DAEMON_CHECKPOINT_DELEGATE");
+
+        // Override the config patch to disable async_mode for this command.
+        // In WrapperDaemon mode async_mode is normally true, which would
+        // still enable delegation even without the env var.
         {
-            command.env("GIT_AI_TEST_CONFIG_PATCH", patch_json);
+            let mut patch_value = self
+                .config_patch
+                .as_ref()
+                .and_then(|p| serde_json::to_value(p).ok())
+                .unwrap_or_else(|| serde_json::json!({}));
+            if let Some(obj) = patch_value.as_object_mut() {
+                let ff = obj
+                    .entry("feature_flags")
+                    .or_insert_with(|| serde_json::json!({}));
+                if let Some(ff_obj) = ff.as_object_mut() {
+                    ff_obj.insert("async_mode".to_string(), serde_json::json!(false));
+                }
+            }
+            if let Ok(patch_json) = serde_json::to_string(&patch_value) {
+                command.env("GIT_AI_TEST_CONFIG_PATCH", patch_json);
+            }
         }
 
         command.env("GIT_AI_TEST_DB_PATH", self.test_db_path.to_str().unwrap());
@@ -2540,12 +2513,6 @@ impl TestRepo {
             } else {
                 format!("{}{}", stdout, stderr)
             };
-            self.sync_queued_checkpoint_for_path(
-                args,
-                &combined,
-                checkpoint_baseline,
-                &absolute_working_dir,
-            );
             Ok(combined)
         } else {
             let combined = if stdout.is_empty() {
