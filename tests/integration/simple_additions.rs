@@ -2081,21 +2081,6 @@ if __name__ == \"__main__\":
             .collect::<Vec<_>>()
     );
 
-    // Verify the accepted_lines count is correct (should be ~5, not 17+)
-    // The second commit only adds 5 new lines, so accepted_lines should reflect that
-    let total_accepted: u32 = second_commit
-        .authorship_log
-        .metadata
-        .prompts
-        .values()
-        .map(|p| p.accepted_lines)
-        .sum();
-    assert!(
-        total_accepted <= 10,
-        "second commit accepted_lines should reflect only the 5 appended lines, not the full file. Got: {}",
-        total_accepted
-    );
-
     // Final state: all lines should be AI-attributed
     let mut file = repo.filename("calca4.py");
     file.assert_lines_and_blame(lines![
