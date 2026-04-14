@@ -1995,14 +1995,14 @@ impl VirtualAttributions {
             // Only add inherited base for sessions that had new checkpoint data.
             // Sessions without new checkpoints already carry the correct cumulative
             // value from INITIAL (preserved by calculate_and_update_prompt_metrics).
-            if session_additions.contains_key(session_id) {
-                if let Some(&(inherited_adds, inherited_dels)) = inherited_totals.get(session_id) {
-                    for prompt_record in commits.values_mut() {
-                        prompt_record.total_additions =
-                            prompt_record.total_additions.saturating_add(inherited_adds);
-                        prompt_record.total_deletions =
-                            prompt_record.total_deletions.saturating_add(inherited_dels);
-                    }
+            if session_additions.contains_key(session_id)
+                && let Some(&(inherited_adds, inherited_dels)) = inherited_totals.get(session_id)
+            {
+                for prompt_record in commits.values_mut() {
+                    prompt_record.total_additions =
+                        prompt_record.total_additions.saturating_add(inherited_adds);
+                    prompt_record.total_deletions =
+                        prompt_record.total_deletions.saturating_add(inherited_dels);
                 }
             }
         }
