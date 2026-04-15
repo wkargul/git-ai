@@ -4350,6 +4350,12 @@ impl ActorDaemonCoordinator {
                     }
                     *v == 0
                 });
+            // Note: the remove_if_mut + contains_key two-step can produce
+            // duplicate stale entries for the same root when two connections
+            // close concurrently (thread B removes the entry between thread A's
+            // remove_if_mut and contains_key).  This is benign — downstream
+            // enqueue_stale_connection_close_fallbacks deduplicates via the
+            // ingr_root_close_fallback_enqueued DashSet.
             if removed.is_some() || !self.ingr_root_open_connections.contains_key(root_sid) {
                 stale_roots.push(root_sid.clone());
             }
@@ -7080,11 +7086,17 @@ impl ActorDaemonCoordinator {
         let payload_root_sid = Self::trace_payload_root_sid(&payload);
         let root_key = payload_root_sid.clone().unwrap_or_default();
 
+        // Early-exit: payloads with no root SID would create an orphaned
+        // normalizer keyed on "", which is never cleaned up.
+        if root_key.is_empty() {
+            return Ok(TracePayloadApplyOutcome::None);
+        }
+
         // Early-exit for already-completed roots.  A late atexit (e.g. from a
         // connection-close fallback) arriving after clear_trace_root_tracking
         // would otherwise lazily create a fresh empty normalizer that is never
         // cleaned up, causing an unbounded slow memory leak.
-        if !root_key.is_empty() && self.completed_root_sids.contains(&root_key) {
+        if self.completed_root_sids.contains(&root_key) {
             return Ok(TracePayloadApplyOutcome::None);
         }
 
