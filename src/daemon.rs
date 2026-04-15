@@ -5314,7 +5314,21 @@ impl ActorDaemonCoordinator {
             None
         };
         let post_repo = if terminal_exit_code.is_some() {
-            read_head_state_for_worktree(&worktree).map(repo_context_from_head_state)
+            let mut state = read_head_state_for_worktree(&worktree);
+            // The HEAD ref file may be transiently unreadable under heavy I/O
+            // (e.g. concurrent git-gc or packed-refs rewrite on CI).  Retry a
+            // few times so we reliably capture post_repo.head — downstream
+            // analysis (HistoryAnalyzer::head_change) depends on it.
+            if state.as_ref().is_none_or(|s| s.head.is_none()) {
+                for _ in 0..4 {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    state = read_head_state_for_worktree(&worktree);
+                    if state.as_ref().is_some_and(|s| s.head.is_some()) {
+                        break;
+                    }
+                }
+            }
+            state.map(repo_context_from_head_state)
         } else {
             None
         };
