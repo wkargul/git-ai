@@ -7167,7 +7167,11 @@ impl ActorDaemonCoordinator {
             .to_string();
         let emitted = {
             let mut normalizer = self.normalizer.lock().await;
-            normalizer.ingest_payload(&payload)?
+            // The normalizer's ingest_payload performs blocking file I/O
+            // during finalize_root_exit (reflog_delta, worktree_head_reflog_delta).
+            // Use block_in_place so Tokio can move other tasks (drain workers,
+            // applied-path handlers) to other threads while this thread is blocked.
+            tokio::task::block_in_place(|| normalizer.ingest_payload(&payload))?
         };
         let Some(command) = emitted else {
             if is_terminal_root_trace_event(
