@@ -7129,11 +7129,39 @@ impl ActorDaemonCoordinator {
         {
             TracePayloadApplyOutcome::QueuedFamily(family)
         } else {
+            // Save test-sync metadata before route_command consumes command,
+            // so we can write a fallback completion log if it fails.
+            let fb_family = command.family_key.as_ref().map(|key| key.0.clone());
+            let fb_session = crate::daemon::test_sync::test_sync_session_from_invocation(
+                &parsed_invocation_for_normalized_command(&command),
+            );
+            let fb_tracked = crate::daemon::test_sync::tracks_primary_command_for_test_sync(
+                command.primary_command.as_deref(),
+                &command.invoked_args,
+            );
+            let fb_primary = command.primary_command.clone();
+            let fb_exit = command.exit_code;
             match self.coordinator.route_command(command).await {
                 Ok(applied) => TracePayloadApplyOutcome::Applied(Box::new(applied)),
                 Err(error) => {
                     let _ = self.clear_trace_root_tracking(&root_sid);
                     let _ = self.discard_carryover_snapshots_for_root(&root_sid);
+                    // Write a fallback completion log so test sync infrastructure
+                    // sees this command instead of timing out waiting for it.
+                    if let Some(family) = &fb_family {
+                        let log_entry = TestCompletionLogEntry {
+                            seq: 0,
+                            family_key: family.clone(),
+                            kind: "command".to_string(),
+                            primary_command: fb_primary,
+                            test_sync_session: fb_session,
+                            exit_code: Some(fb_exit),
+                            sync_tracked: fb_tracked,
+                            status: "error".to_string(),
+                            error: Some(error.to_string()),
+                        };
+                        let _ = self.maybe_append_test_completion_log(family, &log_entry);
+                    }
                     return Err(error);
                 }
             }
