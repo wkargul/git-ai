@@ -177,7 +177,18 @@ fn handle_run(args: &[String]) -> Result<(), String> {
             e
         )
     })?;
+    // Ensure at least 4 Tokio worker threads regardless of CPU count.
+    // The daemon runs concurrent tasks (ingest worker, per-family drain
+    // workers, applied-path handlers, control API) that all need async
+    // thread pool access.  On 2-core machines the default of 2 threads
+    // causes starvation when the ingest worker blocks during normalizer
+    // I/O and drain workers compete for the remaining thread.
+    let worker_threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .max(4);
     let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(worker_threads)
         .enable_all()
         .build()
         .map_err(|e| e.to_string())?;
