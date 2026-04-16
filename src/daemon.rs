@@ -493,6 +493,82 @@ fn repo_context_from_head_state(state: HeadState) -> RepoContext {
     }
 }
 
+/// Last-resort HEAD recovery for commands about to enter the reducer.
+///
+/// When the augmentation and normalizer retries failed to capture
+/// `post_repo.head`, this function makes one more attempt using the
+/// command's worktree.  By the time the drain worker or Applied path
+/// calls this, significantly more time has elapsed since the git
+/// process exited, so the ref file is almost always readable.
+fn recover_post_repo_head_if_missing(cmd: &mut crate::daemon::domain::NormalizedCommand) {
+    let dominated_by_wrapper = cmd.wrapper_invocation_id.is_some();
+    if dominated_by_wrapper {
+        // In wrapper-daemon mode, post_repo is overwritten by the wrapper
+        // overlay — recovery here would be overwritten anyway.
+        return;
+    }
+    let needs_recovery = cmd.exit_code == 0
+        && cmd
+            .post_repo
+            .as_ref()
+            .is_some_and(|r| r.head.is_none())
+        && matches!(
+            cmd.primary_command.as_deref(),
+            Some(
+                "commit"
+                    | "merge"
+                    | "cherry-pick"
+                    | "rebase"
+                    | "reset"
+                    | "pull"
+                    | "stash"
+            )
+        );
+    if !needs_recovery {
+        return;
+    }
+    let Some(worktree) = cmd.worktree.as_deref() else {
+        return;
+    };
+    // Direct file read — at this late point the ref should be stable.
+    if let Some(state) = read_head_state_for_worktree(worktree)
+        && state.head.is_some()
+    {
+        debug_log(&format!(
+            "pre-reducer HEAD recovery succeeded for sid={}",
+            cmd.root_sid
+        ));
+        cmd.post_repo = Some(repo_context_from_head_state(state));
+        return;
+    }
+    // Subprocess fallback.
+    if let Ok(output) = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(worktree)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output()
+    {
+        let oid = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if output.status.success() && is_valid_git_oid(&oid) {
+            debug_log(&format!(
+                "pre-reducer HEAD recovered via git rev-parse for sid={}",
+                cmd.root_sid
+            ));
+            let (branch, detached) = cmd
+                .post_repo
+                .as_ref()
+                .map(|r| (r.branch.clone(), r.detached))
+                .unwrap_or((None, false));
+            cmd.post_repo = Some(RepoContext {
+                head: Some(oid),
+                branch,
+                detached,
+            });
+        }
+    }
+}
+
 fn trace_payload_cmd_name(payload: &Value) -> Option<String> {
     payload
         .get("name")
@@ -5912,6 +5988,10 @@ impl ActorDaemonCoordinator {
                         }
                     }
 
+                    // Last-resort HEAD recovery: by now enough time has
+                    // elapsed that the ref should be readable.
+                    recover_post_repo_head_if_missing(&mut command);
+
                     let side_effect_result = {
                         let future = async {
                             let mut applied = self.coordinator.route_command(*command).await?;
@@ -7428,7 +7508,7 @@ impl ActorDaemonCoordinator {
             // applied-path handlers) to other threads while this thread is blocked.
             tokio::task::block_in_place(|| normalizer.ingest_payload(&payload))?
         };
-        let Some(command) = emitted else {
+        let Some(mut command) = emitted else {
             if is_terminal_root_trace_event(
                 &event,
                 payload
@@ -7446,6 +7526,11 @@ impl ActorDaemonCoordinator {
             }
             return Ok(TracePayloadApplyOutcome::None);
         };
+        // Last-resort HEAD recovery: the normalizer and augmentation may
+        // have failed to read HEAD under heavy I/O.  By now enough time has
+        // elapsed since the git process exited that the ref should be stable.
+        recover_post_repo_head_if_missing(&mut command);
+
         let root_sid = command.root_sid.clone();
 
         let outcome = if let Some(family) = self
