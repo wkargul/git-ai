@@ -5109,3 +5109,157 @@ fn daemon_recovers_from_panic_in_side_effect_pipeline() {
     // Clean shutdown.
     daemon.shutdown();
 }
+
+/// Reproduces the partial-stage attribution loss bug from
+/// `scripts/test-mock-calculator-flow.sh`:
+///
+/// 1. Create calca9.py (18 lines) + calcb9.py (21 lines)
+/// 2. ONE `mock_ai` checkpoint covering BOTH files
+/// 3. `git add calca9.py` — stage only calca9
+/// 4. Append 5 lines to calca9.py (no new checkpoint)
+/// 5. `git commit` → commits staged 18-line calca9 → should be AI-attributed
+/// 6. `git add calca9.py && git commit` → commits the 5 appended lines → BUG: no attribution
+/// 7. `git add calcb9.py && git commit` → commits calcb9 → BUG: empty prompts / no attribution
+///
+/// The key difference from the `agent-v1` tests above is that `mock_ai` generates
+/// a unique agent ID per invocation (timestamp-based), so a single checkpoint
+/// covering both files is the only attribution source.
+fn assert_mock_ai_partial_stage_attribution_carryover(mode: GitTestMode) {
+    let repo = TestRepo::new_with_mode(mode);
+
+    let file_a_rel = "calca9.py";
+    let file_b_rel = "calcb9.py";
+    let file_a_path = repo.path().join(file_a_rel);
+    let file_b_path = repo.path().join(file_b_rel);
+
+    // ---------- Create both calculator files ----------
+
+    let calca9_initial = "\
+\"\"\"Calculator A9 - functional style addition calculator.\"\"\"
+
+
+def add(a, b):
+    return a + b
+
+
+def add_many(*numbers):
+    result = 0
+    for n in numbers:
+        result = add(result, n)
+    return result
+
+
+if __name__ == \"__main__\":
+    x = float(input(\"Enter first number: \"))
+    y = float(input(\"Enter second number: \"))
+    print(f\"{x} + {y} = {add(x, y)}\")
+";
+
+    let calcb9_content = "\
+\"\"\"Calculator B9 - class-based addition calculator.\"\"\"
+
+
+class Calculator:
+    def __init__(self):
+        self.history = []
+
+    def add(self, a, b):
+        result = a + b
+        self.history.append((a, b, result))
+        return result
+
+    def add_many(self, *numbers):
+        total = numbers[0] if numbers else 0
+        for n in numbers[1:]:
+            total = self.add(total, n)
+        return total
+
+    def show_history(self):
+        for a, b, result in self.history:
+            print(f\"{a} + {b} = {result}\")
+";
+
+    fs::write(&file_a_path, calca9_initial).expect("write calca9.py");
+    fs::write(&file_b_path, calcb9_content).expect("write calcb9.py");
+
+    // ---------- ONE mock_ai checkpoint covering BOTH files ----------
+    repo.git_ai(&["checkpoint", "mock_ai", file_a_rel, file_b_rel])
+        .expect("mock_ai checkpoint should succeed");
+
+    // ---------- Stage only calca9.py ----------
+    repo.git(&["add", file_a_rel])
+        .expect("staging calca9.py should succeed");
+
+    // ---------- AI appends 5 lines to calca9.py, fires a new checkpoint ----------
+    let calca9_appended = format!(
+        "{}    extras = input(\"Enter more numbers separated by spaces: \").split()\n    extra_nums = [float(n) for n in extras]\n    all_nums = [x, y] + extra_nums\n    total = add_many(*all_nums)\n    print(f\"Total sum of all {{len(all_nums)}} numbers: {{total}}\")\n",
+        calca9_initial
+    );
+    fs::write(&file_a_path, &calca9_appended).expect("append to calca9.py");
+
+    // AI checkpoint for the appended calca9.py — mirrors real Claude Code flow
+    // where every file edit fires a PostToolUse checkpoint
+    repo.git_ai(&["checkpoint", "mock_ai", file_a_rel])
+        .expect("second mock_ai checkpoint should succeed");
+
+    // ---------- Commit 1: only the staged calca9.py (original 18 lines) ----------
+    repo.git(&["commit", "-m", "test - first calca9.py"])
+        .expect("first commit should succeed");
+
+    // Verify first commit: the committed 18 lines of calca9.py should be AI-attributed
+    let mut file_a = repo.filename(file_a_rel);
+    file_a.assert_committed_lines(
+        calca9_initial
+            .lines()
+            .map(|l| l.to_string().ai())
+            .collect(),
+    );
+
+    // ---------- Commit 2: stage the appended calca9.py, commit ----------
+    repo.git(&["add", file_a_rel])
+        .expect("staging updated calca9.py should succeed");
+    repo.git(&["commit", "-m", "test - second calca9.py"])
+        .expect("second commit should succeed");
+
+    // THIS IS THE BUG: all lines of calca9.py must be AI-attributed after second commit
+    let mut file_a_after = repo.filename(file_a_rel);
+    file_a_after.assert_lines_and_blame(
+        calca9_appended
+            .lines()
+            .map(|l| l.to_string().ai())
+            .collect(),
+    );
+
+    // ---------- Commit 3: stage calcb9.py, commit ----------
+    repo.git(&["add", file_b_rel])
+        .expect("staging calcb9.py should succeed");
+    repo.git(&["commit", "-m", "test - the rest"])
+        .expect("third commit should succeed");
+
+    // calcb9.py lines should be AI-attributed
+    let mut file_b = repo.filename(file_b_rel);
+    file_b.assert_lines_and_blame(
+        calcb9_content
+            .lines()
+            .map(|l| l.to_string().ai())
+            .collect(),
+    );
+}
+
+#[test]
+#[serial]
+fn mock_ai_partial_stage_attribution_carryover_wrapper_daemon() {
+    assert_mock_ai_partial_stage_attribution_carryover(GitTestMode::WrapperDaemon);
+}
+
+#[test]
+#[serial]
+fn mock_ai_partial_stage_attribution_carryover_wrapper() {
+    assert_mock_ai_partial_stage_attribution_carryover(GitTestMode::Wrapper);
+}
+
+#[test]
+#[serial]
+fn mock_ai_partial_stage_attribution_carryover_daemon() {
+    assert_mock_ai_partial_stage_attribution_carryover(GitTestMode::Daemon);
+}

@@ -1279,7 +1279,7 @@ fn collect_unstaged_hunks_from_snapshot(
     Ok((unstaged_hunks, pure_insertion_hunks))
 }
 
-fn split_lines_preserving_terminators(s: &str) -> Vec<&str> {
+pub(crate) fn split_lines_preserving_terminators(s: &str) -> Vec<&str> {
     let mut lines = Vec::new();
     let mut start = 0;
 
@@ -2606,7 +2606,7 @@ fn compute_attributions_for_file(
     }
 }
 
-fn get_file_content_at_commit(
+pub(crate) fn get_file_content_at_commit(
     repo: &Repository,
     commit_sha: &str,
     file_path: &str,

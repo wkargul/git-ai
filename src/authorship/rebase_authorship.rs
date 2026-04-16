@@ -525,7 +525,19 @@ pub fn restore_virtual_attribution_carryover(
         new_va,
         final_state.clone(),
     )?;
-    let initial_attributions = merged_va.to_initial_working_log_only();
+    let mut initial_attributions = merged_va.to_initial_working_log_only();
+
+    // Filter out attributions for lines already committed in new_head.
+    // The merged VA may contain attributions for lines that were committed
+    // in the current commit (e.g., lines 1-18 were committed but the carried VA
+    // still has them). INITIAL should only carry forward uncommitted lines.
+    filter_initial_attributions_to_uncommitted(
+        repo,
+        new_head,
+        &final_state,
+        &mut initial_attributions,
+    );
+
     if initial_attributions.files.is_empty() && initial_attributions.prompts.is_empty() {
         return Ok(());
     }
@@ -538,6 +550,131 @@ pub fn restore_virtual_attribution_carryover(
         final_state,
     )?;
     Ok(())
+}
+
+/// Retain only line attributions that correspond to lines NOT present in `commit_sha`.
+/// Lines that already exist in the commit tree are already handled by the authorship note
+/// and should not appear in the INITIAL working log for the next commit.
+fn filter_initial_attributions_to_uncommitted(
+    repo: &Repository,
+    commit_sha: &str,
+    final_state: &HashMap<String, String>,
+    initial: &mut crate::git::repo_storage::InitialAttributions,
+) {
+    use crate::authorship::virtual_attribution::get_file_content_at_commit;
+
+    let files_to_check: Vec<String> = initial.files.keys().cloned().collect();
+    for file_path in files_to_check {
+        let final_content = match final_state.get(&file_path) {
+            Some(c) => c.clone(),
+            None => {
+                initial.files.remove(&file_path);
+                continue;
+            }
+        };
+
+        let committed_content =
+            get_file_content_at_commit(repo, commit_sha, &file_path).unwrap_or_default();
+
+        if committed_content == final_content {
+            initial.files.remove(&file_path);
+            continue;
+        }
+
+        if committed_content.is_empty() {
+            // File doesn't exist in commit — all lines are uncommitted, keep all
+            continue;
+        }
+
+        // Diff committed content against final_state to find which lines are new
+        // (i.e., not in the commit). Only retain attributions for those lines.
+        let committed_lines =
+            crate::authorship::virtual_attribution::split_lines_preserving_terminators(
+                &committed_content,
+            );
+        let final_lines =
+            crate::authorship::virtual_attribution::split_lines_preserving_terminators(
+                &final_content,
+            );
+        let diff_ops = crate::authorship::imara_diff_utils::capture_diff_slices(
+            &committed_lines,
+            &final_lines,
+        );
+
+        // Collect line numbers (1-indexed in final_state coordinates) that are NOT in the commit
+        let mut uncommitted_lines = std::collections::HashSet::new();
+        for op in &diff_ops {
+            match op {
+                crate::authorship::imara_diff_utils::DiffOp::Insert {
+                    new_index, new_len, ..
+                }
+                | crate::authorship::imara_diff_utils::DiffOp::Replace {
+                    new_index, new_len, ..
+                } => {
+                    let start = *new_index as u32 + 1;
+                    let end = start + *new_len as u32;
+                    for line in start..end {
+                        uncommitted_lines.insert(line);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if uncommitted_lines.is_empty() {
+            // No uncommitted lines — remove file from INITIAL
+            initial.files.remove(&file_path);
+            continue;
+        }
+
+        // Filter the line attributions to only include uncommitted lines
+        if let Some(line_attrs) = initial.files.get_mut(&file_path) {
+            let mut filtered = Vec::new();
+            for attr in line_attrs.iter() {
+                let mut kept_lines: Vec<u32> = Vec::new();
+                for line in attr.start_line..=attr.end_line {
+                    if uncommitted_lines.contains(&line) {
+                        kept_lines.push(line);
+                    }
+                }
+                if !kept_lines.is_empty() {
+                    // Compress into contiguous ranges
+                    let ranges =
+                        crate::authorship::authorship_log::LineRange::compress_lines(&kept_lines);
+                    for range in ranges {
+                        let (start, end) = match range {
+                            crate::authorship::authorship_log::LineRange::Single(l) => (l, l),
+                            crate::authorship::authorship_log::LineRange::Range(s, e) => (s, e),
+                        };
+                        filtered.push(crate::authorship::attribution_tracker::LineAttribution {
+                            start_line: start,
+                            end_line: end,
+                            author_id: attr.author_id.clone(),
+                            overrode: attr.overrode.clone(),
+                        });
+                    }
+                }
+            }
+            if filtered.is_empty() {
+                initial.files.remove(&file_path);
+            } else {
+                *line_attrs = filtered;
+            }
+        }
+    }
+
+    // Clean up prompts: remove any prompt IDs no longer referenced by remaining files
+    let referenced_prompts: std::collections::HashSet<String> = initial
+        .files
+        .values()
+        .flat_map(|attrs| attrs.iter().map(|a| a.author_id.clone()))
+        .collect();
+    initial
+        .prompts
+        .retain(|prompt_id, _| referenced_prompts.contains(prompt_id));
+    initial
+        .humans
+        .retain(|human_id, _| referenced_prompts.contains(human_id));
 }
 
 /// Rewrite authorship after a squash or rebase merge performed in CI/GUI
