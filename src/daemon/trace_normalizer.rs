@@ -7,8 +7,8 @@ use crate::git::cli_parser::{
     explicit_rebase_branch_arg, parse_git_cli_args, rebase_has_control_mode,
 };
 use crate::git::repo_state::{
-    common_dir_for_repo_path, common_dir_for_worktree, git_dir_for_worktree,
-    read_ref_oid_for_common_dir, worktree_root_for_path,
+    common_dir_for_repo_path, common_dir_for_worktree, git_dir_for_worktree, is_valid_git_oid,
+    read_head_state_for_worktree, read_ref_oid_for_common_dir, worktree_root_for_path,
 };
 use crate::observability;
 use crate::utils::debug_log;
@@ -1060,6 +1060,75 @@ impl<B: GitBackend> TraceNormalizer<B> {
             .and_then(|worktree| pending_rebase_original_head_from_inflight(&self.state, worktree))
             .or(pending.rebase_original_head_hint.clone());
         let merge_squash_source_head = pending.merge_squash_source_head;
+
+        // Recovery: if augmentation produced a post_repo with head=None for a
+        // ref-mutating command that exited successfully, the augmentation's
+        // retry (which uses the event's worktree, potentially overwritten by a
+        // child def_repo) may have targeted the wrong path.  Re-attempt HEAD
+        // resolution using invocation_worktree, which is set once at creation
+        // and never overwritten by child events.
+        if may_mutate_refs
+            && exit_code == 0
+            && pending
+                .post_repo
+                .as_ref()
+                .is_some_and(|r| r.head.is_none())
+            && let Some(inv_wt) = pending.invocation_worktree.as_deref()
+        {
+            let mut recovered = read_head_state_for_worktree(inv_wt);
+            if recovered.as_ref().is_none_or(|s| s.head.is_none()) {
+                for attempt in 1..=15 {
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                    recovered = read_head_state_for_worktree(inv_wt);
+                    if recovered.as_ref().is_some_and(|s| s.head.is_some()) {
+                        debug_log(&format!(
+                            "normalizer HEAD recovery succeeded on retry {} for sid={}",
+                            attempt, pending.root_sid
+                        ));
+                        break;
+                    }
+                }
+            }
+            if recovered.as_ref().is_none_or(|s| s.head.is_none()) {
+                if let Ok(output) = std::process::Command::new("git")
+                    .args(["rev-parse", "HEAD"])
+                    .current_dir(inv_wt)
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::null())
+                    .output()
+                {
+                    let oid = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                    if output.status.success() && is_valid_git_oid(&oid) {
+                        debug_log(&format!(
+                            "normalizer HEAD recovered via git rev-parse for sid={}",
+                            pending.root_sid
+                        ));
+                        let (branch, detached) = recovered
+                            .as_ref()
+                            .map(|s| (s.branch.clone(), s.detached))
+                            .unwrap_or((None, false));
+                        recovered = Some(crate::git::repo_state::HeadState {
+                            head: Some(oid),
+                            branch,
+                            detached,
+                        });
+                    }
+                }
+            }
+            if let Some(state) = recovered
+                && state.head.is_some()
+            {
+                debug_log(&format!(
+                    "normalizer HEAD recovery patched post_repo for sid={}",
+                    pending.root_sid
+                ));
+                pending.post_repo = Some(RepoContext {
+                    head: state.head,
+                    branch: state.branch,
+                    detached: state.detached,
+                });
+            }
+        }
 
         let normalized = NormalizedCommand {
             scope,
