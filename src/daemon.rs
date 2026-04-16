@@ -8,8 +8,8 @@ use crate::git::cli_parser::{
 };
 use crate::git::find_repository_in_path;
 use crate::git::repo_state::{
-    HeadState, common_dir_for_worktree, git_dir_for_worktree, latest_reflog_old_oid_for_worktree,
-    read_head_state_for_worktree, read_ref_oid_for_worktree,
+    HeadState, common_dir_for_worktree, git_dir_for_worktree, is_valid_git_oid,
+    latest_reflog_old_oid_for_worktree, read_head_state_for_worktree, read_ref_oid_for_worktree,
     resolve_linear_head_commit_chain_for_worktree, resolve_rebase_segment_for_worktree,
     resolve_reflog_old_oid_for_ref_new_oid_in_worktree, resolve_squash_source_head_for_worktree,
     resolve_stash_target_oid_for_worktree, resolve_worktree_head_reflog_old_oid_for_new_head,
@@ -5331,9 +5331,39 @@ impl ActorDaemonCoordinator {
                         break;
                     }
                 }
+            }
+            // Last resort: use `git rev-parse HEAD` subprocess.  This
+            // uses git's own ref resolution which handles lock files,
+            // packed-refs, and concurrent rewrites more reliably than
+            // raw file reads.
+            if state.as_ref().is_none_or(|s| s.head.is_none()) {
+                if let Ok(output) = std::process::Command::new("git")
+                    .args(["rev-parse", "HEAD"])
+                    .current_dir(&worktree)
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::null())
+                    .output()
+                {
+                    let oid = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                    if output.status.success() && is_valid_git_oid(&oid) {
+                        debug_log(&format!(
+                            "post_repo HEAD recovered via git rev-parse for sid={}",
+                            sid
+                        ));
+                        let (branch, detached) = state
+                            .as_ref()
+                            .map(|s| (s.branch.clone(), s.detached))
+                            .unwrap_or((None, false));
+                        state = Some(HeadState {
+                            head: Some(oid),
+                            branch,
+                            detached,
+                        });
+                    }
+                }
                 if state.as_ref().is_none_or(|s| s.head.is_none()) {
                     debug_log(&format!(
-                        "post_repo HEAD read failed after retries for sid={} worktree={} state={:?}",
+                        "post_repo HEAD read failed after all attempts for sid={} worktree={} state={:?}",
                         sid,
                         worktree.display(),
                         state.as_ref().map(|s| format!("head={:?} branch={:?}", s.head, s.branch)),
