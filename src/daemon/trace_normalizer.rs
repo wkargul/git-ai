@@ -1061,18 +1061,23 @@ impl<B: GitBackend> TraceNormalizer<B> {
             .or(pending.rebase_original_head_hint.clone());
         let merge_squash_source_head = pending.merge_squash_source_head;
 
-        // Recovery: if augmentation produced a post_repo with head=None for a
-        // ref-mutating command that exited successfully, the augmentation's
-        // retry (which uses the event's worktree, potentially overwritten by a
-        // child def_repo) may have targeted the wrong path.  Re-attempt HEAD
-        // resolution using invocation_worktree, which is set once at creation
-        // and never overwritten by child events.
+        // Recovery: if augmentation produced a post_repo with head=None, OR if
+        // the augmentation's worktree was overwritten by a child def_repo (so
+        // the HEAD might be from the wrong repo), re-read HEAD from
+        // invocation_worktree which is set once at creation and never
+        // overwritten by child events.
+        let worktree_was_overwritten = pending
+            .invocation_worktree
+            .as_ref()
+            .zip(pending.worktree.as_ref())
+            .is_some_and(|(inv, cur)| inv != cur);
+        let head_missing = pending
+            .post_repo
+            .as_ref()
+            .is_some_and(|r| r.head.is_none());
         if may_mutate_refs
             && exit_code == 0
-            && pending
-                .post_repo
-                .as_ref()
-                .is_some_and(|r| r.head.is_none())
+            && (head_missing || worktree_was_overwritten)
             && let Some(inv_wt) = pending.invocation_worktree.as_deref()
         {
             let mut recovered = read_head_state_for_worktree(inv_wt);
@@ -1127,6 +1132,12 @@ impl<B: GitBackend> TraceNormalizer<B> {
                     branch: state.branch,
                     detached: state.detached,
                 });
+                // Also restore the worktree to the original invocation path
+                // so downstream processing (reducer, side-effects) uses the
+                // correct repo path.
+                if worktree_was_overwritten {
+                    pending.worktree = pending.invocation_worktree.clone();
+                }
             }
         }
 
