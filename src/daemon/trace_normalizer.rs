@@ -8,7 +8,7 @@ use crate::git::cli_parser::{
 };
 use crate::git::repo_state::{
     common_dir_for_repo_path, common_dir_for_worktree, git_dir_for_worktree,
-    read_ref_oid_for_common_dir, worktree_root_for_path,
+    read_head_state_for_worktree, read_ref_oid_for_common_dir, worktree_root_for_path,
 };
 use crate::observability;
 use crate::utils::debug_log;
@@ -1064,7 +1064,7 @@ impl<B: GitBackend> TraceNormalizer<B> {
         let normalized = NormalizedCommand {
             scope,
             family_key,
-            worktree: pending.worktree,
+            worktree: pending.worktree.clone(),
             root_sid: pending.root_sid,
             raw_argv: pending.raw_argv,
             primary_command,
@@ -1075,7 +1075,34 @@ impl<B: GitBackend> TraceNormalizer<B> {
             started_at_ns: pending.started_at_ns,
             finished_at_ns,
             pre_repo: pending.pre_repo,
-            post_repo: pending.post_repo,
+            post_repo: {
+                // If augmentation failed to capture post_repo.head (transient
+                // I/O during the connection handler), try once more here in the
+                // normalizer — by this point the git process has long since
+                // exited and the filesystem should be stable.
+                let mut pr = pending.post_repo;
+                if pr.as_ref().is_none_or(|r| r.head.is_none())
+                    && exit_code == 0
+                    && may_mutate_refs
+                {
+                    if let Some(worktree) = pending.worktree.as_deref() {
+                        if let Some(state) = read_head_state_for_worktree(worktree) {
+                            if state.head.is_some() {
+                                debug_log(&format!(
+                                    "recovered post_repo.head at finalize for sid={}",
+                                    root_sid
+                                ));
+                                pr = Some(RepoContext {
+                                    head: state.head,
+                                    branch: state.branch,
+                                    detached: state.detached,
+                                });
+                            }
+                        }
+                    }
+                }
+                pr
+            },
             inflight_rebase_original_head,
             merge_squash_source_head,
             carryover_snapshot_id: pending.carryover_snapshot_id,

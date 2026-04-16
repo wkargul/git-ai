@@ -5320,12 +5320,24 @@ impl ActorDaemonCoordinator {
             // few times so we reliably capture post_repo.head — downstream
             // analysis (HistoryAnalyzer::head_change) depends on it.
             if state.as_ref().is_none_or(|s| s.head.is_none()) {
-                for _ in 0..4 {
-                    std::thread::sleep(std::time::Duration::from_millis(5));
+                for attempt in 1..=10 {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
                     state = read_head_state_for_worktree(&worktree);
                     if state.as_ref().is_some_and(|s| s.head.is_some()) {
+                        debug_log(&format!(
+                            "post_repo HEAD read succeeded on retry {} for sid={}",
+                            attempt, sid
+                        ));
                         break;
                     }
+                }
+                if state.as_ref().is_none_or(|s| s.head.is_none()) {
+                    debug_log(&format!(
+                        "post_repo HEAD read failed after retries for sid={} worktree={} state={:?}",
+                        sid,
+                        worktree.display(),
+                        state.as_ref().map(|s| format!("head={:?} branch={:?}", s.head, s.branch)),
+                    ));
                 }
             }
             state.map(repo_context_from_head_state)
