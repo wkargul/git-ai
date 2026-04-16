@@ -986,6 +986,57 @@ mod tests {
     }
 
     #[test]
+    fn test_partial_add_with_snapshot_preserves_unstaged_file_attribution() {
+        // Reproduces the bug where committing only some files from a multi-file
+        // AI checkpoint via the snapshot path (daemon mode) loses attribution for
+        // the uncommitted files.
+        //
+        // Scenario:
+        //   1. AI writes file_a.py and file_b.py
+        //   2. Single checkpoint covers both files
+        //   3. User stages only file_a.py
+        //   4. Commit 1: file_a.py committed (with snapshot containing only file_a.py)
+        //   5. User stages file_b.py
+        //   6. Commit 2: file_b.py committed (with snapshot containing only file_b.py)
+        //   7. file_b.py should have AI attribution in commit 2
+        let tmp_repo = TmpRepo::new().unwrap();
+
+        let file_a_content = "def add(a, b):\n    return a + b\n";
+        let file_b_content = "class Calculator:\n    def add(self, a, b):\n        return a + b\n";
+
+        // Write both files WITHOUT staging
+        tmp_repo.write_file("file_a.py", file_a_content, false).unwrap();
+        tmp_repo.write_file("file_b.py", file_b_content, false).unwrap();
+
+        // AI checkpoint covering both files
+        tmp_repo.trigger_checkpoint_with_ai("mock_ai", None, None).unwrap();
+
+        // Commit 1: only file_a.py, using snapshot (simulates daemon with incomplete snapshot)
+        let commit1_log = tmp_repo.commit_files_with_snapshot(&["file_a.py"], "add file_a").unwrap();
+
+        assert!(
+            !commit1_log.attestations.is_empty(),
+            "Commit 1 should have AI attribution for file_a.py"
+        );
+        assert!(
+            !commit1_log.metadata.prompts.is_empty(),
+            "Commit 1 should have prompt metadata"
+        );
+
+        // Commit 2: file_b.py, also using snapshot
+        let commit2_log = tmp_repo.commit_files_with_snapshot(&["file_b.py"], "add file_b").unwrap();
+
+        assert!(
+            !commit2_log.attestations.is_empty(),
+            "Commit 2 should have AI attribution for file_b.py (carried via INITIAL)"
+        );
+        assert!(
+            !commit2_log.metadata.prompts.is_empty(),
+            "Commit 2 should have prompt metadata for the AI attribution"
+        );
+    }
+
+    #[test]
     fn test_post_commit_utf8_filename_with_ai_attribution() {
         // Create a repo with an initial commit
         let tmp_repo = TmpRepo::new().unwrap();

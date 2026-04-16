@@ -1747,6 +1747,106 @@ fn test_ai_generated_file_then_human_full_rewrite() {
     ]);
 }
 
+#[test]
+fn test_partial_add_multifile_checkpoint_preserves_attribution_across_commits() {
+    let repo = TestRepo::new();
+
+    // --- Create two files (mimics AI writing both) ---
+    let calca_path = repo.path().join("calca9.py");
+    let calcb_path = repo.path().join("calcb9.py");
+
+    let calca_original = "\
+\"\"\"Calculator A9 - functional style addition calculator.\"\"\"
+
+
+def add(a, b):
+    return a + b
+
+
+def add_many(*numbers):
+    result = 0
+    for n in numbers:
+        result = add(result, n)
+    return result
+
+
+if __name__ == \"__main__\":
+    x = float(input(\"Enter first number: \"))
+    y = float(input(\"Enter second number: \"))
+    print(f\"{x} + {y} = {add(x, y)}\")
+";
+
+    let calcb_content = "\
+\"\"\"Calculator B9 - class-based addition calculator.\"\"\"
+
+
+class Calculator:
+    def __init__(self):
+        self.history = []
+
+    def add(self, a, b):
+        result = a + b
+        self.history.append((a, b, result))
+        return result
+
+    def add_many(self, *numbers):
+        total = numbers[0] if numbers else 0
+        for n in numbers[1:]:
+            total = self.add(total, n)
+        return total
+
+    def show_history(self):
+        for a, b, result in self.history:
+            print(f\"{a} + {b} = {result}\")
+";
+
+    fs::write(&calca_path, calca_original).unwrap();
+    fs::write(&calcb_path, calcb_content).unwrap();
+
+    // --- Single AI checkpoint covering both files (mimics real AI session) ---
+    repo.git_ai(&["checkpoint", "mock_ai", "calca9.py", "calcb9.py"])
+        .unwrap();
+
+    // --- User stages only calca9.py, then AI appends more lines ---
+    repo.git(&["add", "calca9.py"]).unwrap();
+
+    let calca_extended = format!(
+        "{}    extras = input(\"Enter more numbers separated by spaces: \").split()\n\
+    extra_nums = [float(n) for n in extras]\n\
+    all_nums = [x, y] + extra_nums\n\
+    total = add_many(*all_nums)\n\
+    print(f\"Total sum of all {{len(all_nums)}} numbers: {{total}}\")\n",
+        calca_original
+    );
+    fs::write(&calca_path, &calca_extended).unwrap();
+
+    // --- Commit 1: only the staged calca9.py (original 18 lines) ---
+    let commit1 = repo.commit("first calca9.py").unwrap();
+    assert!(
+        !commit1.authorship_log.attestations.is_empty(),
+        "Commit 1 should have AI attribution for calca9.py"
+    );
+
+    // --- Commit 2: stage the appended lines (no checkpoint for these), commit ---
+    repo.git(&["add", "calca9.py"]).unwrap();
+    let _commit2 = repo.commit("second calca9.py").unwrap();
+
+    // --- Commit 3: stage calcb9.py, commit ---
+    // calcb9.py was part of the original checkpoint but never staged until now.
+    // Its AI attribution must survive through INITIAL across commits 1 and 2.
+    repo.git(&["add", "calcb9.py"]).unwrap();
+    let commit3 = repo.commit("the rest").unwrap();
+
+    assert!(
+        !commit3.authorship_log.attestations.is_empty(),
+        "Commit 3 should have AI attribution for calcb9.py"
+    );
+    assert!(
+        !commit3.authorship_log.metadata.prompts.is_empty(),
+        "Commit 3 should have prompt metadata for the AI attribution"
+    );
+}
+
 crate::reuse_tests_in_worktree!(
     test_simple_additions_empty_repo,
     test_simple_additions_with_base_commit,
@@ -1759,4 +1859,5 @@ crate::reuse_tests_in_worktree!(
     test_partial_staging_filters_unstaged_lines,
     test_human_stages_some_ai_lines,
     test_ai_generated_file_then_human_full_rewrite,
+    test_partial_add_multifile_checkpoint_preserves_attribution_across_commits,
 );

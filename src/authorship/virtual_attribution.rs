@@ -1383,7 +1383,15 @@ impl VirtualAttributions {
         let committed_hunks = collect_committed_hunks(repo, parent_sha, commit_sha, pathspecs)?;
         let (mut unstaged_hunks, pure_insertion_hunks) =
             if let Some(snapshot) = final_state_snapshot {
-                collect_unstaged_hunks_from_snapshot(repo, commit_sha, pathspecs, snapshot)?
+                let mut augmented = snapshot.clone();
+                for (file_path, (_, line_attrs)) in &self.attributions {
+                    if !line_attrs.is_empty() && !augmented.contains_key(file_path) {
+                        if let Some(content) = self.file_contents.get(file_path) {
+                            augmented.insert(file_path.clone(), content.clone());
+                        }
+                    }
+                }
+                collect_unstaged_hunks_from_snapshot(repo, commit_sha, pathspecs, &augmented)?
             } else {
                 collect_unstaged_hunks(repo, commit_sha, pathspecs)?
             };

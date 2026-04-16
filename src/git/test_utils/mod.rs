@@ -1,13 +1,13 @@
 use crate::authorship::attribution_tracker::Attribution;
 use crate::authorship::authorship_log_serialization::AuthorshipLog;
-use crate::authorship::post_commit::post_commit;
+use crate::authorship::post_commit::{post_commit, post_commit_with_final_state};
 use crate::authorship::working_log::{AgentId, Checkpoint, CheckpointKind};
 use crate::commands::checkpoint_agent::agent_presets::AgentRunResult;
 use crate::commands::{blame, checkpoint::run as checkpoint};
 use crate::error::GitAiError;
 use crate::git::repository::Repository as GitAiRepository;
 use git2::{Repository, Signature};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
@@ -656,6 +656,75 @@ impl TmpRepo {
         )?;
 
         Ok(post_commit_result.1)
+    }
+
+    /// Commit specific files and run post_commit_with_final_state using a snapshot
+    /// that only contains the committed files' content. This simulates the daemon
+    /// path where the carryover snapshot may be incomplete (missing uncheckpointed
+    /// files).
+    pub fn commit_files_with_snapshot(
+        &self,
+        files_to_stage: &[&str],
+        message: &str,
+    ) -> Result<AuthorshipLog, GitAiError> {
+        let mut index = self.repo_git2.index()?;
+        for file in files_to_stage {
+            index.add_path(std::path::Path::new(file))?;
+        }
+        index.write()?;
+
+        let tree_id = index.write_tree()?;
+        let tree = self.repo_git2.find_tree(tree_id)?;
+
+        let fixed_time = git2::Time::new(1672574400, 0);
+        let signature = Signature::new("Test User", "test@example.com", &fixed_time)?;
+
+        let parent_commit = if let Ok(head) = self.repo_git2.head() {
+            head.target()
+                .and_then(|target| self.repo_git2.find_commit(target).ok())
+        } else {
+            None
+        };
+
+        let (parent_sha, commit_id) = if let Some(parent) = parent_commit {
+            let parent_sha = Some(parent.id().to_string());
+            let commit_id = self.repo_git2.commit(
+                Some("HEAD"),
+                &signature,
+                &signature,
+                message,
+                &tree,
+                &[&parent],
+            )?;
+            (parent_sha, commit_id)
+        } else {
+            let commit_id =
+                self.repo_git2
+                    .commit(Some("HEAD"), &signature, &signature, message, &tree, &[])?;
+            (None, commit_id)
+        };
+
+        // Build snapshot containing ONLY committed files — simulates a daemon
+        // committed_final_state that doesn't include untracked/unstaged files.
+        let mut snapshot = HashMap::new();
+        for file in files_to_stage {
+            let file_path = self.path.join(file);
+            if file_path.exists() {
+                let content = fs::read_to_string(&file_path).unwrap_or_default();
+                snapshot.insert(file.to_string(), content);
+            }
+        }
+
+        let result = post_commit_with_final_state(
+            &self.repo_gitai,
+            parent_sha,
+            commit_id.to_string(),
+            "Test User".to_string(),
+            true,
+            Some(&snapshot),
+        )?;
+
+        Ok(result.1)
     }
 
     /// Creates a new branch and switches to it
