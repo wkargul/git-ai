@@ -8,7 +8,7 @@ use crate::git::cli_parser::{
 };
 use crate::git::repo_state::{
     common_dir_for_repo_path, common_dir_for_worktree, git_dir_for_worktree,
-    read_head_state_for_worktree, read_ref_oid_for_common_dir, worktree_root_for_path,
+    read_ref_oid_for_common_dir, worktree_root_for_path,
 };
 use crate::observability;
 use crate::utils::debug_log;
@@ -1064,7 +1064,7 @@ impl<B: GitBackend> TraceNormalizer<B> {
         let normalized = NormalizedCommand {
             scope,
             family_key,
-            worktree: pending.worktree.clone(),
+            worktree: pending.worktree,
             root_sid: pending.root_sid,
             raw_argv: pending.raw_argv,
             primary_command,
@@ -1075,54 +1075,7 @@ impl<B: GitBackend> TraceNormalizer<B> {
             started_at_ns: pending.started_at_ns,
             finished_at_ns,
             pre_repo: pending.pre_repo,
-            post_repo: {
-                // If augmentation captured post_repo but failed to resolve the
-                // HEAD OID (transient I/O during the connection handler), try
-                // once more here in the normalizer — by this point the git
-                // process has long since exited and the filesystem is stable.
-                //
-                // This fallback only activates when post_repo is Some with
-                // head=None.  Augmentation always emits git_ai_post_repo for
-                // terminal events, so post_repo=None means no augmentation
-                // ran (e.g. unit-test injected events) — leave it as-is.
-                let mut pr = pending.post_repo;
-                if let Some(ref repo) = pr {
-                    if repo.head.is_none()
-                        && exit_code == 0
-                        && may_mutate_refs
-                    {
-                        if let Some(worktree) = pending.worktree.as_deref() {
-                            for attempt in 0..10 {
-                                if attempt > 0 {
-                                    std::thread::sleep(std::time::Duration::from_millis(50));
-                                }
-                                if let Some(state) = read_head_state_for_worktree(worktree) {
-                                    if state.head.is_some() {
-                                        if attempt > 0 {
-                                            debug_log(&format!(
-                                                "recovered post_repo.head at finalize retry {} for sid={}",
-                                                attempt, root_sid
-                                            ));
-                                        } else {
-                                            debug_log(&format!(
-                                                "recovered post_repo.head at finalize for sid={}",
-                                                root_sid
-                                            ));
-                                        }
-                                        pr = Some(RepoContext {
-                                            head: state.head,
-                                            branch: state.branch,
-                                            detached: state.detached,
-                                        });
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                pr
-            },
+            post_repo: pending.post_repo,
             inflight_rebase_original_head,
             merge_squash_source_head,
             carryover_snapshot_id: pending.carryover_snapshot_id,
