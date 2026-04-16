@@ -1076,27 +1076,34 @@ impl<B: GitBackend> TraceNormalizer<B> {
             finished_at_ns,
             pre_repo: pending.pre_repo,
             post_repo: {
-                // If augmentation failed to capture post_repo.head (transient
-                // I/O during the connection handler), try once more here in the
-                // normalizer — by this point the git process has long since
-                // exited and the filesystem should be stable.
+                // If augmentation captured post_repo but failed to resolve the
+                // HEAD OID (transient I/O during the connection handler), try
+                // once more here in the normalizer — by this point the git
+                // process has long since exited and the filesystem is stable.
+                //
+                // This fallback only activates when post_repo is Some with
+                // head=None.  Augmentation always emits git_ai_post_repo for
+                // terminal events, so post_repo=None means no augmentation
+                // ran (e.g. unit-test injected events) — leave it as-is.
                 let mut pr = pending.post_repo;
-                if pr.as_ref().is_none_or(|r| r.head.is_none())
-                    && exit_code == 0
-                    && may_mutate_refs
-                {
-                    if let Some(worktree) = pending.worktree.as_deref() {
-                        if let Some(state) = read_head_state_for_worktree(worktree) {
-                            if state.head.is_some() {
-                                debug_log(&format!(
-                                    "recovered post_repo.head at finalize for sid={}",
-                                    root_sid
-                                ));
-                                pr = Some(RepoContext {
-                                    head: state.head,
-                                    branch: state.branch,
-                                    detached: state.detached,
-                                });
+                if let Some(ref repo) = pr {
+                    if repo.head.is_none()
+                        && exit_code == 0
+                        && may_mutate_refs
+                    {
+                        if let Some(worktree) = pending.worktree.as_deref() {
+                            if let Some(state) = read_head_state_for_worktree(worktree) {
+                                if state.head.is_some() {
+                                    debug_log(&format!(
+                                        "recovered post_repo.head at finalize for sid={}",
+                                        root_sid
+                                    ));
+                                    pr = Some(RepoContext {
+                                        head: state.head,
+                                        branch: state.branch,
+                                        detached: state.detached,
+                                    });
+                                }
                             }
                         }
                     }

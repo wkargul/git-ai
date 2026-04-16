@@ -5340,7 +5340,16 @@ impl ActorDaemonCoordinator {
                     ));
                 }
             }
-            state.map(repo_context_from_head_state)
+            // Always produce Some for terminal events so that
+            // git_ai_post_repo is emitted into the payload.  This lets the
+            // normalizer distinguish "augmentation ran but HEAD was
+            // unreadable" (Some with head=None) from "no augmentation at
+            // all" (None, e.g. unit-test injected events).
+            Some(state.map(repo_context_from_head_state).unwrap_or(RepoContext {
+                head: None,
+                branch: None,
+                detached: false,
+            }))
         } else {
             None
         };
