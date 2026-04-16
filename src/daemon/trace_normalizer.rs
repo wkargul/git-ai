@@ -25,6 +25,10 @@ pub struct PendingTraceCommand {
     pub root_cmd_name: Option<String>,
     pub observed_child_commands: Vec<String>,
     pub invocation_worktree: Option<PathBuf>,
+    /// The family key at invocation time, before any def_repo events.
+    /// Used to detect when a child process's def_repo overwrites the
+    /// family to a different repository.
+    pub invocation_family_key: Option<FamilyKey>,
     pub worktree: Option<PathBuf>,
     pub family_key: Option<FamilyKey>,
     pub started_at_ns: u128,
@@ -495,6 +499,7 @@ impl<B: GitBackend> TraceNormalizer<B> {
             root_cmd_name: None,
             observed_child_commands: Vec::new(),
             invocation_worktree: worktree.clone(),
+            invocation_family_key: family_key.clone(),
             worktree,
             family_key,
             started_at_ns,
@@ -1070,25 +1075,23 @@ impl<B: GitBackend> TraceNormalizer<B> {
         // created repo — don't treat that as an overwrite.
         let is_clone_or_init =
             matches!(primary_command.as_deref(), Some("clone" | "init"));
-        let worktree_was_overwritten = !is_clone_or_init
+        // Detect when a child process's def_repo overwrote the family to a
+        // different repository.  Comparing family keys (canonical common .git
+        // dir) avoids false positives from symlink path differences (macOS
+        // /var/folders vs /private/var/folders) and git worktree path
+        // differences (worktree path vs base repo path for the same repo).
+        let family_was_overwritten = !is_clone_or_init
             && pending
-                .invocation_worktree
+                .invocation_family_key
                 .as_ref()
-                .zip(pending.worktree.as_ref())
-                .is_some_and(|(inv, cur)| {
-                    // Canonicalize both paths before comparing so that symlink
-                    // differences (e.g. macOS /var/folders vs /private/var/folders)
-                    // don't produce false positives.
-                    let inv_canon = inv.canonicalize().unwrap_or_else(|_| inv.clone());
-                    let cur_canon = cur.canonicalize().unwrap_or_else(|_| cur.clone());
-                    inv_canon != cur_canon
-                });
+                .zip(pending.family_key.as_ref())
+                .is_some_and(|(inv, cur)| inv != cur);
         let head_missing = pending
             .post_repo
             .as_ref()
             .is_some_and(|r| r.head.is_none());
         if exit_code == 0
-            && ((may_mutate_refs && head_missing) || worktree_was_overwritten)
+            && ((may_mutate_refs && head_missing) || family_was_overwritten)
             && let Some(inv_wt) = pending.invocation_worktree.as_deref()
         {
             let mut recovered = read_head_state_for_worktree(inv_wt);
@@ -1146,8 +1149,9 @@ impl<B: GitBackend> TraceNormalizer<B> {
                 // Also restore the worktree to the original invocation path
                 // so downstream processing (reducer, side-effects) uses the
                 // correct repo path.
-                if worktree_was_overwritten {
+                if family_was_overwritten {
                     pending.worktree = pending.invocation_worktree.clone();
+                    pending.family_key = pending.invocation_family_key.clone();
                 }
             }
         }
