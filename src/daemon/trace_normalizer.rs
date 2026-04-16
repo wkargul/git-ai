@@ -11,7 +11,9 @@ use crate::git::repo_state::{
     read_head_state_for_worktree, read_ref_oid_for_common_dir, worktree_root_for_path,
 };
 use crate::observability;
-use crate::utils::debug_log;
+fn debug_log(msg: &str) {
+    tracing::debug!("{}", msg);
+}
 use serde_json::Value;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;

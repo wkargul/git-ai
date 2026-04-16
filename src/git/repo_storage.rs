@@ -4,7 +4,7 @@ use crate::authorship::authorship_log_serialization::generate_short_hash;
 use crate::authorship::working_log::{CHECKPOINT_API_VERSION, Checkpoint, CheckpointKind};
 use crate::error::GitAiError;
 use crate::git::rewrite_log::{RewriteLogEvent, append_event_to_file};
-use crate::utils::{debug_log, normalize_to_posix};
+use crate::utils::normalize_to_posix;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
@@ -126,10 +126,7 @@ impl RepoStorage {
             // Best-effort; don't fail the commit if we can't write the marker
             let _ = fs::write(&marker, now.to_string());
 
-            debug_log(&format!(
-                "Moved checkpoint directory from {} to old-{}",
-                sha, sha
-            ));
+            tracing::debug!("Moved checkpoint directory from {} to old-{}", sha, sha);
 
             // In production builds, prune old working logs that have expired.
             // Debug builds never prune so developers can inspect old state.
@@ -178,7 +175,7 @@ impl RepoStorage {
             };
 
             if now_secs.saturating_sub(archived_at) >= Self::OLD_WORKING_LOG_RETENTION_SECS {
-                debug_log(&format!("Pruning expired old working log: {}", name_str));
+                tracing::debug!("Pruning expired old working log: {}", name_str);
                 let _ = fs::remove_dir_all(&dir_path);
             }
         }
@@ -192,10 +189,7 @@ impl RepoStorage {
         let new_dir = self.working_logs.join(new_sha);
         if old_dir.exists() && !new_dir.exists() {
             fs::rename(&old_dir, &new_dir)?;
-            debug_log(&format!(
-                "Renamed working log from {} to {}",
-                old_sha, new_sha
-            ));
+            tracing::debug!("Renamed working log from {} to {}", old_sha, new_sha);
         }
         Ok(())
     }
@@ -429,6 +423,11 @@ impl PersistedWorkingLog {
             }
             // opencode can always refetch from its session storage
             "opencode" => false,
+            // pi needs session_path metadata for prompt refresh
+            "pi" => metadata
+                .as_ref()
+                .and_then(|m| m.get("session_path"))
+                .is_none(),
             // github-copilot needs chat_session_path
             "github-copilot" => metadata
                 .as_ref()
@@ -473,10 +472,10 @@ impl PersistedWorkingLog {
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
             if checkpoint.api_version != CHECKPOINT_API_VERSION {
-                debug_log(&format!(
+                tracing::debug!(
                     "unsupported checkpoint api version: {} (silently skipping checkpoint)",
                     checkpoint.api_version
-                ));
+                );
                 continue;
             }
 
@@ -757,18 +756,12 @@ impl PersistedWorkingLog {
             Ok(content) => match serde_json::from_str(&content) {
                 Ok(initial_data) => initial_data,
                 Err(e) => {
-                    debug_log(&format!(
-                        "Failed to parse INITIAL file: {}. Returning empty.",
-                        e
-                    ));
+                    tracing::debug!("Failed to parse INITIAL file: {}. Returning empty.", e);
                     InitialAttributions::default()
                 }
             },
             Err(e) => {
-                debug_log(&format!(
-                    "Failed to read INITIAL file: {}. Returning empty.",
-                    e
-                ));
+                tracing::debug!("Failed to read INITIAL file: {}. Returning empty.", e);
                 InitialAttributions::default()
             }
         }
@@ -778,6 +771,8 @@ impl PersistedWorkingLog {
 #[cfg(test)]
 mod tests {
 
+    use crate::authorship::transcript::AiTranscript;
+    use crate::authorship::working_log::AgentId;
     use crate::git::test_utils::TmpRepo;
 
     use super::*;
@@ -1202,6 +1197,72 @@ mod tests {
         assert!(
             !working_log.initial_file.exists(),
             "INITIAL should be removed when empty"
+        );
+    }
+
+    #[test]
+    fn test_pi_transcript_refetch_requires_session_path_metadata() {
+        let tmp_repo = TmpRepo::new().expect("Failed to create tmp repo");
+        let repo_storage =
+            RepoStorage::for_repo_path(tmp_repo.repo().path(), tmp_repo.repo().workdir().unwrap())
+                .unwrap();
+        let working_log = repo_storage
+            .working_log_for_base_commit("test-commit-sha")
+            .unwrap();
+
+        let mut checkpoint_with_session_path = Checkpoint::new(
+            CheckpointKind::AiAgent,
+            "diff".to_string(),
+            "author".to_string(),
+            vec![],
+        );
+        checkpoint_with_session_path.agent_id = Some(AgentId {
+            tool: "pi".to_string(),
+            id: "session-1".to_string(),
+            model: "anthropic/claude-sonnet-4-5".to_string(),
+        });
+        checkpoint_with_session_path.transcript = Some(AiTranscript::new());
+        checkpoint_with_session_path.agent_metadata = Some(HashMap::from([(
+            "session_path".to_string(),
+            "/tmp/pi-session.jsonl".to_string(),
+        )]));
+
+        working_log
+            .append_checkpoint(&checkpoint_with_session_path)
+            .expect("append checkpoint with session_path");
+
+        let checkpoints = working_log
+            .read_all_checkpoints()
+            .expect("read checkpoints with session_path");
+        assert!(
+            checkpoints[0].transcript.is_none(),
+            "Pi checkpoints with session_path should drop inline transcript"
+        );
+
+        let mut checkpoint_without_session_path = Checkpoint::new(
+            CheckpointKind::AiAgent,
+            "diff-2".to_string(),
+            "author".to_string(),
+            vec![],
+        );
+        checkpoint_without_session_path.agent_id = Some(AgentId {
+            tool: "pi".to_string(),
+            id: "session-2".to_string(),
+            model: "anthropic/claude-sonnet-4-5".to_string(),
+        });
+        checkpoint_without_session_path.transcript = Some(AiTranscript::new());
+        checkpoint_without_session_path.agent_metadata = Some(HashMap::new());
+
+        working_log
+            .append_checkpoint(&checkpoint_without_session_path)
+            .expect("append checkpoint without session_path");
+
+        let checkpoints = working_log
+            .read_all_checkpoints()
+            .expect("read checkpoints without session_path");
+        assert!(
+            checkpoints[1].transcript.is_some(),
+            "Pi checkpoints without session_path should keep inline transcript"
         );
     }
 

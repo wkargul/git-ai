@@ -13,7 +13,7 @@ use git_ai::git::repo_storage::PersistedWorkingLog;
 use git_ai::git::repository as GitAiRepository;
 use git_ai::observability::wrapper_performance_targets::BenchmarkResult;
 use insta::{Settings, assert_debug_snapshot};
-use rand::Rng;
+use rand::RngExt;
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::fs;
@@ -478,8 +478,8 @@ fn shared_daemon_process(repo_path: &Path) -> Arc<DaemonProcess> {
 }
 
 fn start_shared_daemon_process(repo_path: &Path, shard: Option<usize>) -> DaemonProcess {
-    let mut rng = rand::thread_rng();
-    let n: u64 = rng.gen_range(0..10_000_000_000);
+    let mut rng = rand::rng();
+    let n: u64 = rng.random_range(0..10_000_000_000);
     let base = std::env::temp_dir();
     let shard_suffix = shard
         .map(|shard| format!("-pool-{}", shard))
@@ -683,6 +683,7 @@ fn is_known_checkpoint_preset(arg: &str) -> bool {
             | "amp"
             | "windsurf"
             | "opencode"
+            | "pi"
             | "ai_tab"
             | "firebender"
             | "mock_ai"
@@ -935,8 +936,8 @@ impl TestRepo {
         let default_branch = default_branchname();
         let base_branch = base.current_branch();
         if base_branch == default_branch {
-            let mut rng = rand::thread_rng();
-            let n: u64 = rng.gen_range(0..10_000_000_000);
+            let mut rng = rand::rng();
+            let n: u64 = rng.random_range(0..10_000_000_000);
             let temp_branch = format!("base-worktree-{}", n);
             let temp_ref = format!("refs/heads/{}", temp_branch);
             let switch_output = Command::new(real_git_executable())
@@ -958,8 +959,8 @@ impl TestRepo {
             }
         }
 
-        let mut rng = rand::thread_rng();
-        let wt_n: u64 = rng.gen_range(0..10_000_000_000);
+        let mut rng = rand::rng();
+        let wt_n: u64 = rng.random_range(0..10_000_000_000);
         let worktree_path = std::env::temp_dir().join(format!("{}-wt", wt_n));
 
         let output = Command::new(real_git_executable())
@@ -1038,7 +1039,7 @@ impl TestRepo {
             // Reuse the base DB path for linked worktrees so test expectations and daemon writes align.
             base_test_db_path.clone()
         } else {
-            let wt_db_n: u64 = rng.gen_range(0..10_000_000_000);
+            let wt_db_n: u64 = rng.random_range(0..10_000_000_000);
             std::env::temp_dir().join(format!("{}-db", wt_db_n))
         };
 
@@ -1072,8 +1073,8 @@ impl TestRepo {
         // Isolate this test binary's HOME before any git or git-ai subprocess is spawned.
         ensure_isolated_process_home();
 
-        let mut rng = rand::thread_rng();
-        let n: u64 = rng.gen_range(0..10000000000);
+        let mut rng = rand::rng();
+        let n: u64 = rng.random_range(0..10000000000);
         let base = std::env::temp_dir();
         let path = base.join(n.to_string());
         let test_home = base.join(format!("{}-home", n));
@@ -1115,8 +1116,8 @@ impl TestRepo {
         git_mode: GitTestMode,
         daemon_scope: DaemonTestScope,
     ) -> Self {
-        let mut rng = rand::thread_rng();
-        let n: u64 = rng.gen_range(0..10000000000);
+        let mut rng = rand::rng();
+        let n: u64 = rng.random_range(0..10000000000);
         let base = std::env::temp_dir();
         let main_path = base.join(format!("{}-main", n));
         let worktree_path = base.join(format!("{}-wt", n));
@@ -1198,8 +1199,8 @@ impl TestRepo {
         git_mode: GitTestMode,
         daemon_scope: DaemonTestScope,
     ) -> Self {
-        let mut rng = rand::thread_rng();
-        let n: u64 = rng.gen_range(0..10000000000);
+        let mut rng = rand::rng();
+        let n: u64 = rng.random_range(0..10000000000);
         let base = std::env::temp_dir();
         let path = base.join(n.to_string());
         let test_home = base.join(format!("{}-home", n));
@@ -1255,11 +1256,11 @@ impl TestRepo {
         git_mode: GitTestMode,
         daemon_scope: DaemonTestScope,
     ) -> (Self, Self) {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let base = std::env::temp_dir();
 
         // Create bare upstream repository (acts as the remote server)
-        let upstream_n: u64 = rng.gen_range(0..10000000000);
+        let upstream_n: u64 = rng.random_range(0..10000000000);
         let upstream_path = base.join(upstream_n.to_string());
         let upstream_test_home = base.join(format!("{}-home", upstream_n));
         let upstream_test_db_path =
@@ -1284,7 +1285,7 @@ impl TestRepo {
         let _ = upstream.git(&["symbolic-ref", "HEAD", "refs/heads/main"]);
 
         // Clone upstream to create mirror with origin configured
-        let mirror_n: u64 = rng.gen_range(0..10000000000);
+        let mirror_n: u64 = rng.random_range(0..10000000000);
         let mirror_path = base.join(mirror_n.to_string());
         let mirror_test_home = base.join(format!("{}-home", mirror_n));
         let mirror_test_db_path =
@@ -1351,8 +1352,8 @@ impl TestRepo {
         git_mode: GitTestMode,
         daemon_scope: DaemonTestScope,
     ) -> Self {
-        let mut rng = rand::thread_rng();
-        let db_n: u64 = rng.gen_range(0..10000000000);
+        let mut rng = rand::rng();
+        let db_n: u64 = rng.random_range(0..10000000000);
         let test_home = std::env::temp_dir().join(format!("{}-home", db_n));
         let test_db_path = resolve_test_db_path(&std::env::temp_dir(), db_n, &test_home, git_mode);
 
@@ -2463,14 +2464,11 @@ impl TestRepo {
             .current_dir(&absolute_working_dir);
         self.configure_git_ai_env(&mut command);
 
-        // Disable async checkpoint delegation for cross-repo commands.
-        // The working directory belongs to a different repo than the test
-        // repo, so the daemon's completion log is written under the
-        // working dir's family key — which the test sync infrastructure
-        // cannot reliably wait on.  Unsetting the delegation env var and
-        // overriding async_mode=false causes the checkpoint to run locally
-        // in the subprocess — the same product code path used when daemon
-        // checkpoint delegation is not configured.
+        // Do NOT delegate checkpoints to the daemon drain here.  The caller's
+        // CWD may differ from self's repo root (cross-repo / subrepo tests),
+        // so the completion log family key is unpredictable and any async wait
+        // would target the wrong family.  Running synchronously means the
+        // working log is guaranteed to be written before we return.
         command.env_remove("GIT_AI_DAEMON_CHECKPOINT_DELEGATE");
 
         // Override the config patch to disable async_mode for this command.

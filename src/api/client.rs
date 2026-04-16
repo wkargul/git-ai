@@ -2,6 +2,7 @@ use crate::auth::{CredentialStore, OAuthClient};
 use crate::config;
 use crate::error::GitAiError;
 use crate::git::repository::{exec_git, parse_git_var_identity};
+use crate::http;
 use once_cell::sync::Lazy;
 use std::sync::Mutex;
 use url::Url;
@@ -79,7 +80,7 @@ fn resolve_git_identity() -> Option<String> {
 }
 
 /// API client context with optional authentication
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ApiContext {
     /// Base URL for the API (e.g., `https://app.com`)
     pub base_url: String,
@@ -93,6 +94,21 @@ pub struct ApiContext {
     pub timeout_secs: Option<u64>,
 }
 
+impl std::fmt::Debug for ApiContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ApiContext")
+            .field("base_url", &self.base_url)
+            .field(
+                "auth_token",
+                &self.auth_token.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("api_key", &self.api_key.as_ref().map(|_| "[REDACTED]"))
+            .field("author_identity", &self.author_identity)
+            .field("timeout_secs", &self.timeout_secs)
+            .finish()
+    }
+}
+
 impl ApiContext {
     /// Get the default API base URL from config
     /// Uses Config::fresh() to support runtime config updates (daemon mode)
@@ -102,24 +118,32 @@ impl ApiContext {
 
     /// Create a GET request with common headers (User-Agent, X-Distinct-ID)
     /// Use this for all HTTP GET requests to ensure consistent headers.
-    pub fn http_get(url: &str) -> minreq::Request {
-        minreq::get(url)
-            .with_header(
+    /// The returned (Agent, Request) pair uses the system's native certificate store.
+    pub fn http_get(url: &str, timeout_secs: Option<u64>) -> (ureq::Agent, ureq::Request) {
+        let agent = http::build_agent(timeout_secs);
+        let request = agent
+            .get(url)
+            .set(
                 "User-Agent",
-                format!("git-ai/{}", env!("CARGO_PKG_VERSION")),
+                &format!("git-ai/{}", env!("CARGO_PKG_VERSION")),
             )
-            .with_header("X-Distinct-ID", config::get_or_create_distinct_id())
+            .set("X-Distinct-ID", &config::get_or_create_distinct_id());
+        (agent, request)
     }
 
     /// Create a POST request with common headers (User-Agent, X-Distinct-ID)
     /// Use this for all HTTP POST requests to ensure consistent headers.
-    pub fn http_post(url: &str) -> minreq::Request {
-        minreq::post(url)
-            .with_header(
+    /// The returned (Agent, Request) pair uses the system's native certificate store.
+    pub fn http_post(url: &str, timeout_secs: Option<u64>) -> (ureq::Agent, ureq::Request) {
+        let agent = http::build_agent(timeout_secs);
+        let request = agent
+            .post(url)
+            .set(
                 "User-Agent",
-                format!("git-ai/{}", env!("CARGO_PKG_VERSION")),
+                &format!("git-ai/{}", env!("CARGO_PKG_VERSION")),
             )
-            .with_header("X-Distinct-ID", config::get_or_create_distinct_id())
+            .set("X-Distinct-ID", &config::get_or_create_distinct_id());
+        (agent, request)
     }
 
     /// Create a new API context, automatically using stored credentials if available
@@ -205,62 +229,44 @@ impl ApiContext {
         &self,
         endpoint: &str,
         body: &T,
-    ) -> Result<minreq::Response, GitAiError> {
+    ) -> Result<http::Response, GitAiError> {
         let url = self.build_url(endpoint)?;
         let body_json = serde_json::to_string(body).map_err(GitAiError::JsonError)?;
 
-        let mut request = Self::http_post(&url)
-            .with_header("Content-Type", "application/json")
-            .with_body(body_json);
+        let (_agent, mut request) = Self::http_post(&url, self.timeout_secs);
+        request = request.set("Content-Type", "application/json");
 
         if let Some(api_key) = &self.api_key {
-            request = request.with_header("X-API-Key", api_key);
+            request = request.set("X-API-Key", api_key);
             if let Some(identity) = &self.author_identity {
-                request = request.with_header("X-Author-Identity", identity);
+                request = request.set("X-Author-Identity", identity);
             }
         }
         if let Some(token) = &self.auth_token {
-            request = request.with_header("Authorization", format!("Bearer {}", token));
+            request = request.set("Authorization", &format!("Bearer {}", token));
         }
 
-        // Set timeout if specified
-        if let Some(timeout) = self.timeout_secs {
-            request = request.with_timeout(timeout);
-        }
-
-        let response = request
-            .send()
-            .map_err(|e| GitAiError::Generic(format!("HTTP request failed: {}", e)))?;
-
-        Ok(response)
+        http::send_with_body(request, &body_json)
+            .map_err(|e| GitAiError::Generic(format!("HTTP request failed: {}", e)))
     }
 
     /// Make a GET request
-    pub fn get(&self, endpoint: &str) -> Result<minreq::Response, GitAiError> {
+    pub fn get(&self, endpoint: &str) -> Result<http::Response, GitAiError> {
         let url = self.build_url(endpoint)?;
 
-        let mut request = Self::http_get(&url);
+        let (_agent, mut request) = Self::http_get(&url, self.timeout_secs);
 
         if let Some(api_key) = &self.api_key {
-            request = request.with_header("X-API-Key", api_key);
+            request = request.set("X-API-Key", api_key);
             if let Some(identity) = &self.author_identity {
-                request = request.with_header("X-Author-Identity", identity);
+                request = request.set("X-Author-Identity", identity);
             }
         }
         if let Some(token) = &self.auth_token {
-            request = request.with_header("Authorization", format!("Bearer {}", token));
+            request = request.set("Authorization", &format!("Bearer {}", token));
         }
 
-        // Set timeout if specified
-        if let Some(timeout) = self.timeout_secs {
-            request = request.with_timeout(timeout);
-        }
-
-        let response = request
-            .send()
-            .map_err(|e| GitAiError::Generic(format!("HTTP request failed: {}", e)))?;
-
-        Ok(response)
+        http::send(request).map_err(|e| GitAiError::Generic(format!("HTTP request failed: {}", e)))
     }
 }
 

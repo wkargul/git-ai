@@ -12,7 +12,6 @@ use crate::config::{Config, PromptStorageMode};
 use crate::error::GitAiError;
 use crate::git::refs::notes_add;
 use crate::git::repository::Repository;
-use crate::utils::debug_log;
 use std::collections::{HashMap, HashSet};
 use std::io::IsTerminal;
 
@@ -23,12 +22,18 @@ const STATS_SKIP_MAX_HUNKS: usize = 1000;
 const STATS_SKIP_MAX_ADDED_LINES: usize = 6000;
 /// Skip expensive stats for extremely wide commits touching many added-line files.
 const STATS_SKIP_MAX_FILES_WITH_ADDITIONS: usize = 200;
+/// Skip expensive stats for commits that delete a large number of lines.
+/// Deletion-heavy commits (e.g. removing many files) trigger the same expensive
+/// diff-parsing path as large addition commits, but the added-lines estimate is
+/// near zero, so the cost was previously invisible to the estimator.
+const STATS_SKIP_MAX_DELETED_LINES: usize = 6000;
 
 #[derive(Debug, Clone, Copy)]
 struct StatsCostEstimate {
     files_with_additions: usize,
     added_lines: usize,
     hunk_ranges: usize,
+    deleted_lines: usize,
 }
 
 fn checkpoint_entry_requires_post_processing(
@@ -91,10 +96,10 @@ pub fn post_commit_with_final_state(
 
     // Batch upsert all prompts to database after refreshing (non-fatal if it fails)
     if let Err(e) = batch_upsert_prompts_to_db(&parent_working_log, &working_log, &commit_sha) {
-        debug_log(&format!(
+        tracing::debug!(
             "[Warning] Failed to batch upsert prompts to database: {}",
             e
-        ));
+        );
         crate::observability::log_error(
             &e,
             Some(serde_json::json!({
@@ -179,7 +184,7 @@ pub fn post_commit_with_final_state(
             // Store in notes: redact secrets but keep messages in notes
             let count = redact_secrets_from_prompts(&mut authorship_log.metadata.prompts);
             if count > 0 {
-                debug_log(&format!("Redacted {} secrets from prompts", count));
+                tracing::debug!("Redacted {} secrets from prompts", count);
             }
         }
         PromptStorageMode::Default => {
@@ -196,19 +201,16 @@ pub fn post_commit_with_final_state(
                 let redaction_count =
                     redact_secrets_from_prompts(&mut authorship_log.metadata.prompts);
                 if redaction_count > 0 {
-                    debug_log(&format!(
+                    tracing::debug!(
                         "Redacted {} secrets from prompts before CAS upload",
                         redaction_count
-                    ));
+                    );
                 }
 
                 if let Err(e) =
                     enqueue_prompt_messages_to_cas(repo, &mut authorship_log.metadata.prompts)
                 {
-                    debug_log(&format!(
-                        "[Warning] Failed to enqueue prompt messages to CAS: {}",
-                        e
-                    ));
+                    tracing::debug!("[Warning] Failed to enqueue prompt messages to CAS: {}", e);
                     // Enqueue failed - still strip messages (never keep in notes for "default")
                     strip_prompt_messages(&mut authorship_log.metadata.prompts);
                 }
@@ -265,19 +267,17 @@ pub fn post_commit_with_final_state(
     } else {
         match skip_reason.as_ref() {
             Some(StatsSkipReason::MergeCommit) => {
-                debug_log(&format!(
-                    "Skipping post-commit stats for merge commit {}",
-                    commit_sha
-                ));
+                tracing::debug!("Skipping post-commit stats for merge commit {}", commit_sha);
             }
             Some(StatsSkipReason::Expensive(estimate)) => {
-                debug_log(&format!(
-                    "Skipping expensive post-commit stats for {} (files_with_additions={}, added_lines={}, hunks={})",
+                tracing::debug!(
+                    "Skipping expensive post-commit stats for {} (files_with_additions={}, added_lines={}, deleted_lines={}, hunks={})",
                     commit_sha,
                     estimate.files_with_additions,
                     estimate.added_lines,
+                    estimate.deleted_lines,
                     estimate.hunk_ranges
-                ));
+                );
             }
             None => {}
         }
@@ -315,9 +315,10 @@ pub fn post_commit_with_final_state(
                 }
                 Some(StatsSkipReason::Expensive(estimate)) => {
                     eprintln!(
-                        "[git-ai] Skipped git-ai stats for large commit (files_with_additions={}, added_lines={}, hunks={}). Run `git-ai stats {}` to compute stats on demand.",
+                        "[git-ai] Skipped git-ai stats for large commit (files_with_additions={}, added_lines={}, deleted_lines={}, hunks={}). Run `git-ai stats {}` to compute stats on demand.",
                         estimate.files_with_additions,
                         estimate.added_lines,
+                        estimate.deleted_lines,
                         estimate.hunk_ranges,
                         commit_sha
                     );
@@ -339,6 +340,7 @@ fn should_skip_expensive_post_commit_stats(estimate: &StatsCostEstimate) -> bool
     estimate.hunk_ranges >= STATS_SKIP_MAX_HUNKS
         || estimate.added_lines >= STATS_SKIP_MAX_ADDED_LINES
         || estimate.files_with_additions >= STATS_SKIP_MAX_FILES_WITH_ADDITIONS
+        || estimate.deleted_lines >= STATS_SKIP_MAX_DELETED_LINES
 }
 
 /// Public result of the stats cost estimate for a commit, used by the async
@@ -382,7 +384,8 @@ fn estimate_stats_cost(
     commit_sha: &str,
     ignore_patterns: &[String],
 ) -> Result<StatsCostEstimate, GitAiError> {
-    let mut added_lines_by_file = repo.diff_added_lines(parent_sha, commit_sha, None)?;
+    let (mut added_lines_by_file, total_deleted_lines) =
+        repo.diff_added_lines_with_deleted_count(parent_sha, commit_sha)?;
     let ignore_matcher = build_ignore_matcher(ignore_patterns);
     added_lines_by_file
         .retain(|file_path, _| !should_ignore_file_with_matcher(file_path, &ignore_matcher));
@@ -407,6 +410,7 @@ fn estimate_stats_cost(
         files_with_additions,
         added_lines,
         hunk_ranges,
+        deleted_lines: total_deleted_lines,
     })
 }
 
@@ -733,8 +737,9 @@ fn record_commit_metrics(
 #[cfg(test)]
 mod tests {
     use super::{
-        STATS_SKIP_MAX_ADDED_LINES, STATS_SKIP_MAX_FILES_WITH_ADDITIONS, STATS_SKIP_MAX_HUNKS,
-        StatsCostEstimate, count_line_ranges, should_skip_expensive_post_commit_stats,
+        STATS_SKIP_MAX_ADDED_LINES, STATS_SKIP_MAX_DELETED_LINES,
+        STATS_SKIP_MAX_FILES_WITH_ADDITIONS, STATS_SKIP_MAX_HUNKS, StatsCostEstimate,
+        count_line_ranges, should_skip_expensive_post_commit_stats,
     };
     use crate::git::test_utils::TmpRepo;
 
@@ -754,6 +759,7 @@ mod tests {
             files_with_additions: STATS_SKIP_MAX_FILES_WITH_ADDITIONS - 1,
             added_lines: STATS_SKIP_MAX_ADDED_LINES - 1,
             hunk_ranges: STATS_SKIP_MAX_HUNKS - 1,
+            deleted_lines: STATS_SKIP_MAX_DELETED_LINES - 1,
         };
         assert!(!should_skip_expensive_post_commit_stats(&below_threshold));
 
@@ -761,6 +767,7 @@ mod tests {
             files_with_additions: 1,
             added_lines: 1,
             hunk_ranges: STATS_SKIP_MAX_HUNKS,
+            deleted_lines: 0,
         };
         assert!(should_skip_expensive_post_commit_stats(&by_hunks));
 
@@ -768,6 +775,7 @@ mod tests {
             files_with_additions: 1,
             added_lines: STATS_SKIP_MAX_ADDED_LINES,
             hunk_ranges: 1,
+            deleted_lines: 0,
         };
         assert!(should_skip_expensive_post_commit_stats(&by_added_lines));
 
@@ -775,8 +783,17 @@ mod tests {
             files_with_additions: STATS_SKIP_MAX_FILES_WITH_ADDITIONS,
             added_lines: 1,
             hunk_ranges: 1,
+            deleted_lines: 0,
         };
         assert!(should_skip_expensive_post_commit_stats(&by_files));
+
+        let by_deleted_lines = StatsCostEstimate {
+            files_with_additions: 0,
+            added_lines: 0,
+            hunk_ranges: 0,
+            deleted_lines: STATS_SKIP_MAX_DELETED_LINES,
+        };
+        assert!(should_skip_expensive_post_commit_stats(&by_deleted_lines));
     }
 
     #[test]
@@ -879,6 +896,7 @@ mod tests {
             files_with_additions: 0,
             added_lines: 0,
             hunk_ranges: STATS_SKIP_MAX_HUNKS,
+            deleted_lines: 0,
         };
         assert!(
             should_skip_expensive_post_commit_stats(&at_hunks),
@@ -890,6 +908,7 @@ mod tests {
             files_with_additions: 0,
             added_lines: STATS_SKIP_MAX_ADDED_LINES,
             hunk_ranges: 0,
+            deleted_lines: 0,
         };
         assert!(
             should_skip_expensive_post_commit_stats(&at_added),
@@ -901,10 +920,23 @@ mod tests {
             files_with_additions: STATS_SKIP_MAX_FILES_WITH_ADDITIONS,
             added_lines: 0,
             hunk_ranges: 0,
+            deleted_lines: 0,
         };
         assert!(
             should_skip_expensive_post_commit_stats(&at_files),
             "Exactly at files-with-additions threshold should skip"
+        );
+
+        // Exactly at deleted-lines threshold alone should trigger skip.
+        let at_deleted = StatsCostEstimate {
+            files_with_additions: 0,
+            added_lines: 0,
+            hunk_ranges: 0,
+            deleted_lines: STATS_SKIP_MAX_DELETED_LINES,
+        };
+        assert!(
+            should_skip_expensive_post_commit_stats(&at_deleted),
+            "Exactly at deleted-lines threshold should skip"
         );
 
         // All at zero should NOT skip.
@@ -912,6 +944,7 @@ mod tests {
             files_with_additions: 0,
             added_lines: 0,
             hunk_ranges: 0,
+            deleted_lines: 0,
         };
         assert!(
             !should_skip_expensive_post_commit_stats(&all_zero),
