@@ -1488,7 +1488,7 @@ fn apply_revert_attribution_side_effect(
     let reverted_ref = match revert_source_ref_from_command(cmd) {
         Some(r) => r,
         None => {
-            debug_log("daemon revert: no source ref found in command args");
+            tracing::debug!("daemon revert: no source ref found in command args");
             return Ok(());
         }
     };
@@ -1507,14 +1507,14 @@ fn apply_revert_attribution_side_effect(
     };
 
     if reverted_commit.is_empty() || is_zero_oid(&reverted_commit) {
-        debug_log("daemon revert: reverted commit resolved to empty/zero OID");
+        tracing::debug!("daemon revert: reverted commit resolved to empty/zero OID");
         return Ok(());
     }
 
-    debug_log(&format!(
+    tracing::debug!(
         "daemon revert: reverted_commit={} new_head={}",
         reverted_commit, new_head
-    ));
+    );
 
     // Check if the reverted commit has AI attribution
     let reverted_has_ai = match get_reference_as_authorship_log_v3(&repo, &reverted_commit) {
@@ -1524,10 +1524,10 @@ fn apply_revert_attribution_side_effect(
 
     if reverted_has_ai {
         // Reverting an AI commit → undoing AI work → no attribution to copy
-        debug_log(&format!(
+        tracing::debug!(
             "daemon revert: reverted commit {} has AI attribution, this revert undoes AI work",
             reverted_commit
-        ));
+        );
         return Ok(());
     }
 
@@ -1539,10 +1539,10 @@ fn apply_revert_attribution_side_effect(
         Err(_) => false,
     };
     if !is_revert {
-        debug_log(&format!(
+        tracing::debug!(
             "daemon revert: reverted commit {} is not itself a revert, skipping parent check",
             reverted_commit
-        ));
+        );
         return Ok(());
     }
 
@@ -1566,14 +1566,14 @@ fn apply_revert_attribution_side_effect(
     };
 
     let Some(source_sha) = source_sha else {
-        debug_log("daemon revert: no AI attribution found in revert chain");
+        tracing::debug!("daemon revert: no AI attribution found in revert chain");
         return Ok(());
     };
 
-    debug_log(&format!(
+    tracing::debug!(
         "daemon revert: copying attribution from {} to {}",
         source_sha, new_head
-    ));
+    );
 
     // Copy the attribution note from source to the new commit
     match get_reference_as_authorship_log_v3(&repo, &source_sha) {
@@ -1582,17 +1582,17 @@ fn apply_revert_attribution_side_effect(
             if let Ok(serialized) = log.serialize_to_string()
                 && let Err(e) = notes_add(&repo, new_head, &serialized)
             {
-                debug_log(&format!(
+                tracing::debug!(
                     "daemon revert: failed to add note to {}: {}",
                     new_head, e
-                ));
+                );
             }
         }
         Err(e) => {
-            debug_log(&format!(
+            tracing::debug!(
                 "daemon revert: failed to read authorship log from {}: {}",
                 source_sha, e
-            ));
+            );
         }
     }
 
@@ -7135,10 +7135,10 @@ impl ActorDaemonCoordinator {
                         if let Err(e) =
                             apply_revert_attribution_side_effect(&worktree, cmd, new_head)
                         {
-                            debug_log(&format!(
+                            tracing::debug!(
                                 "daemon revert attribution side effect failed for {}: {}",
                                 worktree, e
-                            ));
+                            );
                         }
                     }
                     _ => {}

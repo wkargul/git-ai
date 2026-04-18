@@ -3,7 +3,6 @@ use crate::git::cli_parser::{ParsedGitInvocation, is_dry_run};
 use crate::git::refs::{get_reference_as_authorship_log_v3, notes_add};
 use crate::git::repository::Repository;
 use crate::git::rewrite_log::{RevertMixedEvent, RewriteLogEvent};
-use crate::utils::debug_log;
 
 /// Pre-revert hook: capture the commit being reverted and store it for the post-hook.
 pub fn pre_revert_hook(
@@ -11,13 +10,13 @@ pub fn pre_revert_hook(
     repository: &mut Repository,
     command_hooks_context: &mut CommandHooksContext,
 ) {
-    debug_log("=== REVERT PRE-COMMAND HOOK ===");
+    tracing::debug!("=== REVERT PRE-COMMAND HOOK ===");
 
     // Capture the current HEAD before the revert
     if let Ok(head) = repository.head()
         && let Ok(target) = head.target()
     {
-        debug_log(&format!("Pre-revert HEAD: {}", target));
+        tracing::debug!("Pre-revert HEAD: {}", target);
         command_hooks_context.revert_original_head = Some(target);
     }
 }
@@ -29,23 +28,23 @@ pub fn post_revert_hook(
     exit_status: std::process::ExitStatus,
     repository: &mut Repository,
 ) {
-    debug_log("=== REVERT POST-COMMAND HOOK ===");
-    debug_log(&format!("Exit status: {}", exit_status));
+    tracing::debug!("=== REVERT POST-COMMAND HOOK ===");
+    tracing::debug!("Exit status: {}", exit_status);
 
     if !exit_status.success() {
-        debug_log("Revert failed or was aborted, skipping attribution");
+        tracing::debug!("Revert failed or was aborted, skipping attribution");
         return;
     }
 
     if is_dry_run(&parsed_args.command_args) {
-        debug_log("Skipping revert post-hook for dry-run");
+        tracing::debug!("Skipping revert post-hook for dry-run");
         return;
     }
 
     let original_head = match &command_hooks_context.revert_original_head {
         Some(head) => head.clone(),
         None => {
-            debug_log("No original head captured in pre-revert hook");
+            tracing::debug!("No original head captured in pre-revert hook");
             return;
         }
     };
@@ -55,25 +54,25 @@ pub fn post_revert_hook(
         Ok(head) => match head.target() {
             Ok(target) => target,
             Err(e) => {
-                debug_log(&format!("Failed to get HEAD target: {}", e));
+                tracing::debug!("Failed to get HEAD target: {}", e);
                 return;
             }
         },
         Err(e) => {
-            debug_log(&format!("Failed to get HEAD: {}", e));
+            tracing::debug!("Failed to get HEAD: {}", e);
             return;
         }
     };
 
     if original_head == new_head {
-        debug_log("HEAD did not change, nothing to do");
+        tracing::debug!("HEAD did not change, nothing to do");
         return;
     }
 
-    debug_log(&format!(
+    tracing::debug!(
         "Revert created new commit: {} (was: {})",
         new_head, original_head
-    ));
+    );
 
     // The reverted commit is the parent of the new commit that is NOT the original head.
     // For `git revert <sha>`, the new commit's parent is original_head, and <sha> is what
@@ -86,11 +85,11 @@ pub fn post_revert_hook(
 
     let reverted_commit = match reverted_commit {
         Some(sha) => {
-            debug_log(&format!("Reverted commit: {}", sha));
+            tracing::debug!("Reverted commit: {}", sha);
             sha
         }
         None => {
-            debug_log("Could not determine which commit was reverted");
+            tracing::debug!("Could not determine which commit was reverted");
             return;
         }
     };
@@ -104,11 +103,11 @@ pub fn post_revert_hook(
 
     let source_sha = match source_sha {
         Some(sha) => {
-            debug_log(&format!("Attribution source commit: {}", sha));
+            tracing::debug!("Attribution source commit: {}", sha);
             sha
         }
         None => {
-            debug_log("No AI attribution found in revert chain, skipping");
+            tracing::debug!("No AI attribution found in revert chain, skipping");
             // Still emit the RevertMixed event for logging
             emit_revert_event(repository, &reverted_commit, &new_head);
             return;
@@ -121,7 +120,7 @@ pub fn post_revert_hook(
     // Emit the RevertMixed event
     emit_revert_event(repository, &reverted_commit, &new_head);
 
-    debug_log("Revert attribution handling complete");
+    tracing::debug!("Revert attribution handling complete");
 }
 
 /// Find the commit that was reverted by parsing args or commit message.
@@ -193,10 +192,10 @@ fn find_attribution_source(repository: &Repository, reverted_commit: &str) -> Op
     if has_ai_attribution(repository, reverted_commit) {
         // The reverted commit has AI attribution. This means we're undoing AI work
         // (the revert deletes AI-authored lines). Don't copy any attribution.
-        debug_log(&format!(
+        tracing::debug!(
             "Reverted commit {} has AI attribution — this revert undoes AI work, no attribution to copy",
             reverted_commit
-        ));
+        );
         return None;
     }
 
@@ -210,21 +209,21 @@ fn find_attribution_source(repository: &Repository, reverted_commit: &str) -> Op
     // B's parent is A. If A has AI attribution, copy it to C.
 
     if !is_revert_commit(repository, reverted_commit) {
-        debug_log(&format!(
+        tracing::debug!(
             "Reverted commit {} is not itself a revert commit, skipping parent check",
             reverted_commit
-        ));
+        );
         return None;
     }
 
-    debug_log(&format!(
+    tracing::debug!(
         "Reverted commit {} is a revert commit with no AI attribution, checking parent",
         reverted_commit
-    ));
+    );
 
     let parent_sha = get_first_parent(repository, reverted_commit)?;
 
-    debug_log(&format!("Parent of reverted commit: {}", parent_sha));
+    tracing::debug!("Parent of reverted commit: {}", parent_sha);
 
     if has_ai_attribution(repository, &parent_sha) {
         return Some(parent_sha);
@@ -239,19 +238,19 @@ fn has_ai_attribution(repository: &Repository, commit_sha: &str) -> bool {
         Ok(log) => {
             // Check if any prompt record has accepted_lines > 0
             let has_ai = log.metadata.prompts.values().any(|p| p.accepted_lines > 0);
-            debug_log(&format!(
+            tracing::debug!(
                 "Commit {} has_ai_attribution: {} (prompts: {})",
                 commit_sha,
                 has_ai,
                 log.metadata.prompts.len()
-            ));
+            );
             has_ai
         }
         Err(_) => {
-            debug_log(&format!(
+            tracing::debug!(
                 "Commit {} has no parseable authorship note",
                 commit_sha
-            ));
+            );
             false
         }
     }
@@ -264,7 +263,7 @@ fn is_revert_commit(repository: &Repository, commit_sha: &str) -> bool {
         Ok(commit) => {
             let summary = commit.summary().unwrap_or_default();
             let is_revert = summary.starts_with("Revert ");
-            debug_log(&format!(
+            tracing::debug!(
                 "Commit {} is_revert_commit: {} (summary: {:?})",
                 commit_sha,
                 is_revert,
@@ -272,14 +271,14 @@ fn is_revert_commit(repository: &Repository, commit_sha: &str) -> bool {
                     .char_indices()
                     .nth(40)
                     .map_or(summary.len(), |(i, _)| i)]
-            ));
+            );
             is_revert
         }
         Err(e) => {
-            debug_log(&format!(
+            tracing::debug!(
                 "Failed to read commit message for {}: {}",
                 commit_sha, e
-            ));
+            );
             false
         }
     }
@@ -293,7 +292,7 @@ fn get_first_parent(repository: &Repository, commit_sha: &str) -> Option<String>
             parents.next().map(|p| p.id().to_string())
         }
         Err(e) => {
-            debug_log(&format!("Failed to find commit {}: {}", commit_sha, e));
+            tracing::debug!("Failed to find commit {}: {}", commit_sha, e);
             None
         }
     }
@@ -309,25 +308,25 @@ fn copy_attribution_note(repository: &Repository, source_sha: &str, target_sha: 
             match log.serialize_to_string() {
                 Ok(serialized) => match notes_add(repository, target_sha, &serialized) {
                     Ok(_) => {
-                        debug_log(&format!(
+                        tracing::debug!(
                             "Copied attribution from {} to {}",
                             source_sha, target_sha
-                        ));
+                        );
                     }
                     Err(e) => {
-                        debug_log(&format!("Failed to add note to {}: {}", target_sha, e));
+                        tracing::debug!("Failed to add note to {}: {}", target_sha, e);
                     }
                 },
                 Err(e) => {
-                    debug_log(&format!("Failed to serialize authorship log: {}", e));
+                    tracing::debug!("Failed to serialize authorship log: {}", e);
                 }
             }
         }
         Err(e) => {
-            debug_log(&format!(
+            tracing::debug!(
                 "Failed to read authorship log from {}: {}",
                 source_sha, e
-            ));
+            );
         }
     }
 }
@@ -344,8 +343,8 @@ fn emit_revert_event(repository: &mut Repository, reverted_commit: &str, new_hea
     ));
 
     match repository.storage.append_rewrite_event(event) {
-        Ok(_) => debug_log("Logged RevertMixed event"),
-        Err(e) => debug_log(&format!("Failed to log RevertMixed event: {}", e)),
+        Ok(_) => tracing::debug!("Logged RevertMixed event"),
+        Err(e) => tracing::debug!("Failed to log RevertMixed event: {}", e),
     }
 }
 
