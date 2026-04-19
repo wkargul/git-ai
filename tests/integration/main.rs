@@ -72,6 +72,7 @@ mod notes_merge_mixed_fanout;
 mod opencode;
 mod performance;
 mod pi;
+mod pre_commit_unit;
 mod prompt_across_commit;
 mod prompt_hash_migration;
 mod prompt_picker_test;
