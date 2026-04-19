@@ -58,6 +58,7 @@ mod github_integration;
 mod gix_config_tests;
 mod graphite;
 mod ignore_prompts;
+mod ignore_unit;
 mod initial_attributions;
 mod install_hooks_comprehensive;
 mod internal_db_integration;
