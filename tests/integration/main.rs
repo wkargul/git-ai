@@ -78,6 +78,7 @@ mod prompt_across_commit;
 mod prompt_hash_migration;
 mod prompt_picker_test;
 mod prompts_db_test;
+mod range_authorship_unit;
 mod pull_rebase_ff;
 mod push_upstream_authorship;
 mod realistic_complex_edits;
