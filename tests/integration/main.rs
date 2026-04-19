@@ -88,6 +88,7 @@ mod rebase_hooks_unit;
 mod rebase_merge_commit_note_leak;
 mod rebase_note_integrity;
 mod rebase_realworld;
+mod repo_storage_unit;
 mod reset;
 mod search;
 mod secrets_benchmark;
