@@ -2,6 +2,11 @@ name: Perf Instrumentation Probe
 
 on:
   workflow_dispatch:
+    inputs:
+      test_filter:
+        description: "Integration test filter (space-separated module names)"
+        required: false
+        default: "cherry_pick"
 
 jobs:
   perf-probe:
@@ -36,21 +41,23 @@ jobs:
         env:
           CARGO_INCREMENTAL: "0"
 
-      # Run a focused slice of the integration suite with perf instrumentation
-      # enabled.  `simple_additions` is the most representative set: it exercises
-      # checkpoint, commit (post-commit notes write), and blame in sequence, which
-      # are the three hot subprocess-heavy paths identified in the Windows audit.
+      # Run the selected integration tests with perf instrumentation enabled.
+      # The filter defaults to cherry_pick because that is where Patch 2
+      # (batch notes writes) has the most impact: each multi-commit cherry-pick
+      # previously spawned 2×N git subprocesses for notes; after the fix it
+      # spawns exactly 2 regardless of N.
       #
-      # continue-on-error is set because some _in_worktree variants are known to
-      # be flaky on Windows.  The [git-ai perf] report is emitted by the atexit
-      # handler of each subprocess regardless of test pass/fail, so the artifact
-      # is always useful even when individual tests fail.
+      # continue-on-error is set because _in_worktree variants are pre-existing
+      # failures on macOS/Linux worktree setups and do not affect the perf data.
+      # The [git-ai perf] report is printed by libc::atexit inside each
+      # subprocess and by the test binary itself, so the artifact is always
+      # useful even when individual tests fail.
       - name: Run perf probe
         shell: bash
         continue-on-error: true
         run: |
           cargo test --package git-ai --test integration \
-            -- --test-threads=1 simple_additions \
+            -- --test-threads=1 ${{ inputs.test_filter }} \
             --nocapture 2>&1 | tee perf.log
         env:
           GIT_AI_DEBUG_PERFORMANCE: "1"
