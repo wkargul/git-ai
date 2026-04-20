@@ -525,4 +525,3 @@ fn delete_working_log_for_files(
 
     Ok(())
 }
-

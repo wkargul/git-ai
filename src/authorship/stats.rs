@@ -750,4 +750,3 @@ pub fn calculate_waiting_time(transcript: &crate::authorship::transcript::AiTran
 
     total_waiting_time
 }
-

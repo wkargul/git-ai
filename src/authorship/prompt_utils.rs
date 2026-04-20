@@ -738,4 +738,3 @@ pub fn format_transcript(prompt: &PromptRecord) -> String {
     }
     output
 }
-

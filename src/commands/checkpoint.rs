@@ -2274,4 +2274,3 @@ fn upsert_checkpoint_prompt_to_db(
 
     Ok(())
 }
-
