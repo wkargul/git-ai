@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use crate::metrics::MetricEvent;
 
+pub mod perf;
 pub mod wrapper_performance_targets;
 
 /// Maximum events per metrics envelope

@@ -322,31 +322,35 @@ impl InternalDatabase {
 
     /// Create a new database connection
     fn new() -> Result<Self, GitAiError> {
-        let db_path = Self::database_path()?;
+        // Measure full cold-open cost: path resolution, dir creation,
+        // Connection::open, PRAGMA batch, and schema-version SELECT.
+        crate::observability::perf::measure("sqlite.open", || {
+            let db_path = Self::database_path()?;
 
-        // Ensure parent directory exists
-        if let Some(parent) = db_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
+            // Ensure parent directory exists
+            if let Some(parent) = db_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
 
-        // Open with WAL mode and performance optimizations
-        let conn = Connection::open(&db_path)?;
-        conn.execute_batch(
-            r#"
+            // Open with WAL mode and performance optimizations
+            let conn = Connection::open(&db_path)?;
+            conn.execute_batch(
+                r#"
             PRAGMA journal_mode=WAL;
             PRAGMA synchronous=NORMAL;
             PRAGMA cache_size=-2000;
             PRAGMA temp_store=MEMORY;
             "#,
-        )?;
+            )?;
 
-        let mut db = Self {
-            conn,
-            _db_path: db_path,
-        };
-        db.initialize_schema()?;
+            let mut db = Self {
+                conn,
+                _db_path: db_path,
+            };
+            db.initialize_schema()?;
 
-        Ok(db)
+            Ok(db)
+        })
     }
 
     /// Get database path: ~/.git-ai/internal/db
@@ -498,14 +502,15 @@ impl InternalDatabase {
 
     /// Upsert a prompt record
     pub fn upsert_prompt(&mut self, record: &PromptDbRecord) -> Result<(), GitAiError> {
-        let messages_json = serde_json::to_string(&record.messages)?;
-        let metadata_json = record
-            .agent_metadata
-            .as_ref()
-            .and_then(|m| serde_json::to_string(m).ok());
+        crate::observability::perf::measure("sqlite.upsert_prompt", || {
+            let messages_json = serde_json::to_string(&record.messages)?;
+            let metadata_json = record
+                .agent_metadata
+                .as_ref()
+                .and_then(|m| serde_json::to_string(m).ok());
 
-        self.conn.execute(
-            r#"
+            self.conn.execute(
+                r#"
             INSERT INTO prompts (
                 id, workdir, tool, model, external_thread_id,
                 messages, commit_sha, agent_metadata, human_author,
@@ -525,26 +530,27 @@ impl InternalDatabase {
                 overridden_lines = excluded.overridden_lines,
                 updated_at = excluded.updated_at
             "#,
-            params![
-                record.id,
-                record.workdir,
-                record.tool,
-                record.model,
-                record.external_thread_id,
-                messages_json,
-                record.commit_sha,
-                metadata_json,
-                record.human_author,
-                record.total_additions,
-                record.total_deletions,
-                record.accepted_lines,
-                record.overridden_lines,
-                record.created_at,
-                record.updated_at,
-            ],
-        )?;
+                params![
+                    record.id,
+                    record.workdir,
+                    record.tool,
+                    record.model,
+                    record.external_thread_id,
+                    messages_json,
+                    record.commit_sha,
+                    metadata_json,
+                    record.human_author,
+                    record.total_additions,
+                    record.total_deletions,
+                    record.accepted_lines,
+                    record.overridden_lines,
+                    record.created_at,
+                    record.updated_at,
+                ],
+            )?;
 
-        Ok(())
+            Ok(())
+        })
     }
 
     /// Batch upsert multiple prompts (for post-commit)
@@ -553,6 +559,7 @@ impl InternalDatabase {
             return Ok(());
         }
 
+        crate::observability::perf::measure("sqlite.batch_upsert_prompts", || {
         let tx = self.conn.transaction()?;
 
         {
@@ -609,10 +616,12 @@ impl InternalDatabase {
 
         tx.commit()?;
         Ok(())
+        })
     }
 
     /// Get a prompt by ID
     pub fn get_prompt(&self, id: &str) -> Result<Option<PromptDbRecord>, GitAiError> {
+        crate::observability::perf::measure("sqlite.get_prompt", || {
         let mut stmt = self.conn.prepare(
             "SELECT id, workdir, tool, model, external_thread_id, messages,
                     commit_sha, agent_metadata, human_author,
@@ -659,6 +668,7 @@ impl InternalDatabase {
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(e.into()),
         }
+        })
     }
 
     /// Get all prompts for a given commit (future use)

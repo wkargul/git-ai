@@ -1081,7 +1081,9 @@ impl TestRepo {
         let test_db_path = resolve_test_db_path(&base, n, &test_home, git_mode);
 
         // Clone from cached template (git init + config + symbolic-ref already done)
+        let _copy_t = Instant::now();
         clone_template_to(&path);
+        git_ai::observability::perf::record("test.setup_copy_template", _copy_t.elapsed());
 
         let mut repo = Self {
             path,
@@ -2689,30 +2691,47 @@ impl Drop for TestRepo {
                 ])
                 .output();
 
+            let _t = Instant::now();
             let _ = remove_dir_all_with_retry(&self.path, 80, Duration::from_millis(50));
+            git_ai::observability::perf::record("test.teardown_worktree_dir", _t.elapsed());
+
+            let _t = Instant::now();
             let _ = remove_dir_all_with_retry(base_path, 80, Duration::from_millis(50));
+            git_ai::observability::perf::record("test.teardown_base_repo_dir", _t.elapsed());
 
             if let Some(base_db_path) = &self._base_test_db_path
                 && remove_test_db
             {
+                let _t = Instant::now();
                 let _ = remove_dir_all_with_retry(base_db_path, 40, Duration::from_millis(25));
+                git_ai::observability::perf::record("test.teardown_base_db_dir", _t.elapsed());
             }
 
             if remove_test_db {
+                let _t = Instant::now();
                 let _ =
                     remove_dir_all_with_retry(&self.test_db_path, 40, Duration::from_millis(25));
+                git_ai::observability::perf::record("test.teardown_db_dir", _t.elapsed());
             }
+            let _t = Instant::now();
             let _ = remove_dir_all_with_retry(&self.test_home, 40, Duration::from_millis(25));
+            git_ai::observability::perf::record("test.teardown_home_dir", _t.elapsed());
             return;
         }
 
+        let _t = Instant::now();
         remove_dir_all_with_retry(&self.path, 80, Duration::from_millis(50))
             .expect("failed to remove test repo");
+        git_ai::observability::perf::record("test.teardown_repo_dir", _t.elapsed());
         // Also clean up the test database directory (may not exist if no DB operations were done)
         if remove_test_db {
+            let _t = Instant::now();
             let _ = remove_dir_all_with_retry(&self.test_db_path, 40, Duration::from_millis(25));
+            git_ai::observability::perf::record("test.teardown_db_dir", _t.elapsed());
         }
+        let _t = Instant::now();
         let _ = remove_dir_all_with_retry(&self.test_home, 40, Duration::from_millis(25));
+        git_ai::observability::perf::record("test.teardown_home_dir", _t.elapsed());
     }
 }
 

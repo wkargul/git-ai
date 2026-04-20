@@ -3167,7 +3167,8 @@ pub fn exec_git_allow_nonzero_with_profile(
         }
     }
 
-    cmd.output().map_err(GitAiError::IoError)
+    let label = crate::observability::perf::git_subcommand_label(&effective_args);
+    crate::observability::perf::measure(label, || cmd.output().map_err(GitAiError::IoError))
 }
 
 /// Helper to execute a git command with an explicit internal profile.
@@ -3206,6 +3207,10 @@ pub fn exec_git_stdin_with_profile(
     // TODO Make sure to handle process signals, etc.
     let effective_args =
         args_with_internal_git_profile(&args_with_disabled_hooks_if_needed(args), profile);
+    // Timer is dropped (and records) at every return point, including via `?`.
+    let _perf_timer = crate::observability::perf::Timer::start(
+        crate::observability::perf::git_subcommand_label(&effective_args),
+    );
     let mut cmd = Command::new(config::Config::get().git_cmd());
     cmd.args(&effective_args)
         .stdin(std::process::Stdio::piped())
@@ -3278,6 +3283,10 @@ pub fn exec_git_stdin_with_env_with_profile(
     // TODO Make sure to handle process signals, etc.
     let effective_args =
         args_with_internal_git_profile(&args_with_disabled_hooks_if_needed(args), profile);
+    // Timer is dropped (and records) at every return point, including via `?`.
+    let _perf_timer = crate::observability::perf::Timer::start(
+        crate::observability::perf::git_subcommand_label(&effective_args),
+    );
     let mut cmd = Command::new(config::Config::get().git_cmd());
     cmd.args(&effective_args)
         .stdin(std::process::Stdio::piped())
