@@ -2028,6 +2028,12 @@ pub fn rewrite_authorship_after_cherry_pick(
     };
 
     // Step 3: Process each new commit in order (oldest to newest)
+    // Collect note entries and write them in a single batch after the loop.
+    // This reduces git subprocess spawns from 2×N (one rev-parse + one fast-import
+    // per commit) down to 2 total, matching the pattern already used in
+    // rewrite_authorship_after_rebase_v2.
+    let mut pending_note_entries: Vec<(String, String)> = Vec::new();
+
     for (idx, new_commit) in new_commits.iter().enumerate() {
         tracing::debug!(
             "Processing cherry-picked commit {}/{}: {}",
@@ -2104,12 +2110,21 @@ pub fn rewrite_authorship_after_cherry_pick(
             }
         };
 
-        crate::git::refs::notes_add(repo, new_commit, &authorship_json)?;
+        pending_note_entries.push((new_commit.clone(), authorship_json));
 
         tracing::debug!(
-            "Saved authorship log for cherry-picked commit {} ({} files)",
+            "Queued authorship log for cherry-picked commit {} ({} files)",
             new_commit,
             authorship_log.attestations.len()
+        );
+    }
+
+    // Write all notes in one fast-import call instead of one per commit.
+    if !pending_note_entries.is_empty() {
+        crate::git::refs::notes_add_batch(repo, &pending_note_entries)?;
+        tracing::debug!(
+            "Wrote {} authorship notes in a single batch",
+            pending_note_entries.len()
         );
     }
 
