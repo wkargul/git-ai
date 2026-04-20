@@ -1,0 +1,66 @@
+name: Perf Instrumentation Probe
+
+on:
+  workflow_dispatch:
+
+jobs:
+  perf-probe:
+    name: Perf probe (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-perf-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-perf-
+            ${{ runner.os }}-cargo-
+
+      # Compile the test binary separately so the perf log only contains
+      # test execution output, not cargo's compilation progress.
+      - name: Build test binary
+        run: cargo test --no-run --test integration
+        env:
+          CARGO_INCREMENTAL: "0"
+
+      # Run a focused slice of the integration suite with perf instrumentation
+      # enabled.  `simple_additions` is the most representative set: it exercises
+      # checkpoint, commit (post-commit notes write), and blame in sequence, which
+      # are the three hot subprocess-heavy paths identified in the Windows audit.
+      #
+      # continue-on-error is set because some _in_worktree variants are known to
+      # be flaky on Windows.  The [git-ai perf] report is emitted by the atexit
+      # handler of each subprocess regardless of test pass/fail, so the artifact
+      # is always useful even when individual tests fail.
+      - name: Run perf probe
+        shell: bash
+        continue-on-error: true
+        run: |
+          cargo test --package git-ai --test integration \
+            -- --test-threads=1 simple_additions \
+            --nocapture 2>&1 | tee perf.log
+        env:
+          GIT_AI_DEBUG_PERFORMANCE: "1"
+          GIT_AI_TEST_GIT_MODE: wrapper
+          CARGO_INCREMENTAL: "0"
+
+      - name: Upload perf.log
+        if: always()
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: perf-log-${{ matrix.os }}
+          path: perf.log
+          if-no-files-found: warn
