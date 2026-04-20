@@ -188,6 +188,7 @@ pub fn update_prompt_from_tool(
 }
 
 /// Update Codex prompt from rollout transcript file
+#[doc(hidden)]
 pub fn update_codex_prompt(
     metadata: Option<&HashMap<String, String>>,
     current_model: &str,
@@ -260,6 +261,7 @@ fn update_cursor_prompt(
 }
 
 /// Update Claude prompt from transcript file
+#[doc(hidden)]
 pub fn update_claude_prompt(
     metadata: Option<&HashMap<String, String>>,
     current_model: &str,
@@ -304,6 +306,7 @@ pub fn update_claude_prompt(
 }
 
 /// Update Gemini prompt from transcript file
+#[doc(hidden)]
 pub fn update_gemini_prompt(
     metadata: Option<&HashMap<String, String>>,
     current_model: &str,
@@ -348,6 +351,7 @@ pub fn update_gemini_prompt(
 }
 
 /// Update GitHub Copilot prompt from chat session file
+#[doc(hidden)]
 pub fn update_github_copilot_prompt(
     metadata: Option<&HashMap<String, String>>,
     current_model: &str,
@@ -394,6 +398,7 @@ pub fn update_github_copilot_prompt(
 }
 
 /// Update Continue CLI prompt from transcript file
+#[doc(hidden)]
 pub fn update_continue_cli_prompt(
     metadata: Option<&HashMap<String, String>>,
     current_model: &str,
@@ -436,6 +441,7 @@ pub fn update_continue_cli_prompt(
 }
 
 /// Update Droid prompt from transcript and settings files
+#[doc(hidden)]
 pub fn update_droid_prompt(
     metadata: Option<&HashMap<String, String>>,
     current_model: &str,
@@ -637,6 +643,7 @@ fn update_pi_prompt(
 }
 
 /// Update Windsurf prompt from transcript JSONL file
+#[doc(hidden)]
 pub fn update_windsurf_prompt(
     metadata: Option<&HashMap<String, String>>,
     current_model: &str,

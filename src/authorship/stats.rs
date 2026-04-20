@@ -579,6 +579,7 @@ pub fn stats_for_commit_stats(
     ))
 }
 
+#[doc(hidden)]
 pub fn accepted_lines_from_attestations(
     authorship_log: Option<&crate::authorship::authorship_log_serialization::AuthorshipLog>,
     added_lines_by_file: &HashMap<String, Vec<u32>>,
@@ -641,6 +642,7 @@ pub fn accepted_lines_from_attestations(
     (total_ai_accepted, known_human_accepted, per_tool_model)
 }
 
+#[doc(hidden)]
 pub fn line_range_overlap_len(range: &LineRange, added_lines: &[u32]) -> u32 {
     match range {
         LineRange::Single(line) => u32::from(added_lines.binary_search(line).is_ok()),
@@ -695,6 +697,7 @@ pub fn get_git_diff_stats(
 }
 
 /// Calculate time waiting for AI from transcript messages
+#[doc(hidden)]
 pub fn calculate_waiting_time(transcript: &crate::authorship::transcript::AiTranscript) -> u64 {
     let mut total_waiting_time = 0u64;
     let messages = transcript.messages();

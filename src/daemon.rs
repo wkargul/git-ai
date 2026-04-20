@@ -1874,6 +1874,7 @@ fn capture_recent_working_log_snapshot(
     }))
 }
 
+#[doc(hidden)]
 pub fn restore_recent_working_log_snapshot(
     repo: &Repository,
     base_commit: &str,
@@ -3661,6 +3662,7 @@ struct PendingRootSlot {
 }
 
 #[derive(Debug, Clone, Default)]
+#[doc(hidden)]
 pub struct RecentWorkingLogSnapshot {
     pub files: HashMap<String, Vec<crate::authorship::attribution_tracker::LineAttribution>>,
     pub prompts: HashMap<String, crate::authorship::authorship_log::PromptRecord>,
