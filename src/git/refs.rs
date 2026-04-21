@@ -400,7 +400,23 @@ pub fn get_commits_with_notes_from_list(
         }
     }
 
-    // Build the result Vec
+    // Batch-fetch all note contents in 2 subprocess calls instead of N.
+    //
+    // Before: get_authorship(repo, sha) per commit
+    //         → show_authorship_note() → `git notes --ref=ai show <sha>`
+    //         = N subprocess spawns, each costing ~50 ms on Windows.
+    //
+    // After:
+    //   Step 1 — note_blob_oids_for_commits: 1 × `git cat-file --batch-check`
+    //            returns commit_sha → blob_oid for every commit that has a note.
+    //   Step 2 — batch_read_blob_contents: 1 × `git cat-file --batch`
+    //            returns blob_oid → raw JSON content.
+    //   Deserialisation happens in-process with no further subprocesses.
+    let blob_oids_by_commit = note_blob_oids_for_commits(repo, commit_shas)?;
+
+    let blob_oid_vec: Vec<String> = blob_oids_by_commit.values().cloned().collect();
+    let blob_contents = batch_read_blob_contents(repo, &blob_oid_vec)?;
+
     let mut result = Vec::new();
     for sha in commit_shas {
         let git_author = commit_authors
@@ -408,18 +424,27 @@ pub fn get_commits_with_notes_from_list(
             .cloned()
             .unwrap_or_else(|| "Unknown".to_string());
 
-        // Check if this commit has a note by trying to show it
-        if let Some(authorship_log) = get_authorship(repo, sha) {
-            result.push(CommitAuthorship::Log {
+        let authorship_log = blob_oids_by_commit
+            .get(sha)
+            .and_then(|blob_oid| blob_contents.get(blob_oid))
+            .and_then(|content| {
+                let mut log = AuthorshipLog::deserialize_from_string(content).ok()?;
+                // Align base_commit_sha with the annotated commit,
+                // matching the behaviour of get_authorship().
+                log.metadata.base_commit_sha = sha.to_string();
+                Some(log)
+            });
+
+        match authorship_log {
+            Some(log) => result.push(CommitAuthorship::Log {
                 sha: sha.clone(),
                 git_author,
-                authorship_log,
-            });
-        } else {
-            result.push(CommitAuthorship::NoLog {
+                authorship_log: log,
+            }),
+            None => result.push(CommitAuthorship::NoLog {
                 sha: sha.clone(),
                 git_author,
-            });
+            }),
         }
     }
 
