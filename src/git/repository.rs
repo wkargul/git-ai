@@ -1191,6 +1191,15 @@ pub struct Repository {
     canonical_workdir: PathBuf,
     /// Cached git author identity resolved via `git var GIT_COMMITTER_IDENT`.
     cached_author_identity: std::sync::OnceLock<GitAuthorIdentity>,
+    /// Cached result of `git symbolic-ref HEAD`.
+    /// Safe to cache because a Repository object lives for at most one hook
+    /// invocation; HEAD does not change within that window.
+    /// Value is the full refname (e.g. "refs/heads/main") or "HEAD" for
+    /// detached HEAD / bare repositories.
+    cached_head_refname: std::sync::OnceLock<String>,
+    /// Cached result of `git rev-parse --is-bare-repository`.
+    /// Falls back to `false` if the subprocess fails (safe default).
+    cached_is_bare: std::sync::OnceLock<bool>,
 }
 
 impl Repository {
@@ -1279,26 +1288,21 @@ impl Repository {
     // If HEAD is a symbolic ref, return the refname (e.g., "refs/heads/main").
     // Otherwise, return "HEAD".
     pub fn head<'a>(&'a self) -> Result<Reference<'a>, GitAiError> {
-        let mut args = self.global_args_for_exec();
-        args.push("symbolic-ref".to_string());
-        // args.push("-q".to_string());
-        args.push("HEAD".to_string());
-
-        let output = exec_git(&args);
-
-        match output {
-            Ok(output) if output.status.success() => {
-                let refname = String::from_utf8(output.stdout)?;
-                Ok(Reference {
-                    repo: self,
-                    ref_name: refname.trim().to_string(),
-                })
+        let refname = self.cached_head_refname.get_or_init(|| {
+            let mut args = self.global_args_for_exec();
+            args.push("symbolic-ref".to_string());
+            args.push("HEAD".to_string());
+            match exec_git(&args) {
+                Ok(output) if output.status.success() => String::from_utf8(output.stdout)
+                    .map(|s| s.trim().to_string())
+                    .unwrap_or_else(|_| "HEAD".to_string()),
+                _ => "HEAD".to_string(),
             }
-            _ => Ok(Reference {
-                repo: self,
-                ref_name: "HEAD".to_string(),
-            }),
-        }
+        });
+        Ok(Reference {
+            repo: self,
+            ref_name: refname.clone(),
+        })
     }
 
     // Returns the path to the .git folder for normal repositories or the repository itself for bare repositories.
@@ -1322,12 +1326,16 @@ impl Repository {
 
     /// Returns true when this repository is bare.
     pub fn is_bare_repository(&self) -> Result<bool, GitAiError> {
-        let mut args = self.global_args_for_exec();
-        args.push("rev-parse".to_string());
-        args.push("--is-bare-repository".to_string());
-        let output = exec_git(&args)?;
-        let value = String::from_utf8(output.stdout)?;
-        Ok(value.trim() == "true")
+        Ok(*self.cached_is_bare.get_or_init(|| {
+            let mut args = self.global_args_for_exec();
+            args.push("rev-parse".to_string());
+            args.push("--is-bare-repository".to_string());
+            exec_git(&args)
+                .ok()
+                .and_then(|output| String::from_utf8(output.stdout).ok())
+                .map(|s| s.trim() == "true")
+                .unwrap_or(false)
+        }))
     }
 
     /// Get the canonical (absolute, resolved) path of the working directory
@@ -2552,6 +2560,8 @@ pub fn find_repository(global_args: &[String]) -> Result<Repository, GitAiError>
         workdir,
         canonical_workdir,
         cached_author_identity: std::sync::OnceLock::new(),
+        cached_head_refname: std::sync::OnceLock::new(),
+        cached_is_bare: std::sync::OnceLock::new(),
     })
 }
 
@@ -2867,6 +2877,8 @@ pub fn from_bare_repository(git_dir: &Path) -> Result<Repository, GitAiError> {
         workdir,
         canonical_workdir,
         cached_author_identity: std::sync::OnceLock::new(),
+        cached_head_refname: std::sync::OnceLock::new(),
+        cached_is_bare: std::sync::OnceLock::new(),
     })
 }
 
@@ -2924,6 +2936,8 @@ fn repository_from_discovered_paths(
         workdir: workdir.to_path_buf(),
         canonical_workdir,
         cached_author_identity: std::sync::OnceLock::new(),
+        cached_head_refname: std::sync::OnceLock::new(),
+        cached_is_bare: std::sync::OnceLock::new(),
     })
 }
 
